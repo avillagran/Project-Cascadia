@@ -824,7 +824,21 @@ static GLuint make_shader(GLenum type, const char *src)
  * shaders, their constants, the draw's state and command.  A first draw
  * with a trivial shader takes the driver's own setup out of the way; every
  * page that is not zero after it goes to OUTDIR/baseline.pages, so what
- * each case changed can be told byte by byte. */
+ * each case changed can be told byte by byte.
+ *
+ * A case's file may say how it is drawn, a line each (M34):
+ *   // mode: points|lines|line_strip|line_loop|triangle_strip|triangle_fan
+ *            (triangles by default; "p" then a few vertices across the target)
+ *   // width: N        glLineWidth(N)
+ *   // blend: alpha|add   SRC_ALPHA, ONE_MINUS_SRC_ALPHA -- or ONE, ONE
+ *   // depth: less     a depth buffer, the test and the writes on
+ *   // tex2d: W H [mip] [linear]   the 2D texture: its size, every level
+ *                      (glGenerateMipmap), linear filters
+ *   // cube: N [linear]   the cube map's faces N x N
+ *   // draws: N        drawn N times in the frame, the 2D texture another
+ *                      (a second of the same size) every other draw
+ *   // indexed         glDrawElements, 16-bit indices
+ *   // pages: all      every page that is not zero, not only those changed */
 
 struct page_hash {
     uint32_t addr;
@@ -986,11 +1000,95 @@ static GLuint link_logged(const char *vs, const char *fs)
     return p;
 }
 
-static float attr_data[16][3][4];
+static float attr_data[16][8][4];
+
+/* how a case is drawn (its "// key: value" lines) */
+struct case_opts {
+    GLenum mode;
+    int nverts;
+    float width;
+    int blend;          /* 0 off, 1 alpha, 2 add */
+    int depth;
+    int tex_w, tex_h, tex_mip, tex_linear;
+    int cube_n, cube_linear;
+    int draws;
+    int indexed;
+    int all_pages;
+};
+
+static const char *opt_value(const char *text, const char *key)
+{
+    char pat[64];
+    const char *at;
+
+    snprintf(pat, sizeof pat, "// %s", key);
+    at = strstr(text, pat);
+    if (!at)
+        return NULL;
+    at += strlen(pat);
+    while (*at == ':' || *at == ' ')
+        at++;
+    return at;
+}
+
+static void case_options(const char *text, struct case_opts *o)
+{
+    const char *v;
+
+    memset(o, 0, sizeof(*o));
+    o->mode = GL_TRIANGLES;
+    o->nverts = 3;
+    o->draws = 1;
+    o->tex_w = o->tex_h = 4;
+    o->cube_n = 4;
+    if ((v = opt_value(text, "mode"))) {
+        static const struct { const char *name; GLenum mode; int n; } m[] = {
+            { "points", GL_POINTS, 3 }, { "line_strip", GL_LINE_STRIP, 4 },
+            { "line_loop", GL_LINE_LOOP, 4 }, { "lines", GL_LINES, 4 },
+            { "triangle_strip", GL_TRIANGLE_STRIP, 4 }, { "triangle_fan", GL_TRIANGLE_FAN, 4 },
+        };
+        for (unsigned i = 0; i < sizeof(m) / sizeof(m[0]); i++)
+            if (!strncmp(v, m[i].name, strlen(m[i].name))) {
+                o->mode = m[i].mode;
+                o->nverts = m[i].n;
+                break;
+            }
+    }
+    if ((v = opt_value(text, "width")))
+        o->width = atof(v);
+    if ((v = opt_value(text, "blend")))
+        o->blend = !strncmp(v, "add", 3) ? 2 : 1;
+    o->depth = opt_value(text, "depth") != NULL;
+    if ((v = opt_value(text, "tex2d"))) {
+        o->tex_w = atoi(v);
+        while (*v && *v != ' ')
+            v++;
+        o->tex_h = atoi(v);
+        o->tex_mip = strstr(v, "mip") && strstr(v, "mip") < strchr(v, '\n');
+        o->tex_linear = strstr(v, "linear") && strstr(v, "linear") < strchr(v, '\n');
+    }
+    if ((v = opt_value(text, "cube"))) {
+        o->cube_n = atoi(v);
+        o->cube_linear = strstr(v, "linear") && strstr(v, "linear") < strchr(v, '\n');
+    }
+    if ((v = opt_value(text, "draws")))
+        o->draws = atoi(v) > 0 ? atoi(v) : 1;
+    o->indexed = opt_value(text, "indexed") != NULL;
+    o->all_pages = (v = opt_value(text, "pages")) && !strncmp(v, "all", 3);
+}
+
+static struct case_opts copt;
 
 static void corpus_attribs(GLuint prog)
 {
     static const float tri[3][4] = { { -1, -1, 0, 1 }, { 3, -1, 0, 1 }, { -1, 3, 0, 1 } };
+    /* for the other modes: a quad's corners, in strip order for the
+     * strips and lines, round it for the fans and loops */
+    static const float quad[4][4] = { { -0.75f, -0.75f, 0, 1 }, { 0.75f, -0.75f, 0, 1 },
+                                      { -0.75f, 0.75f, 0, 1 }, { 0.75f, 0.75f, 0, 1 } };
+    static const float round[4][4] = { { -0.75f, -0.75f, 0, 1 }, { 0.75f, -0.75f, 0, 1 },
+                                       { 0.75f, 0.75f, 0, 1 }, { -0.75f, 0.75f, 0, 1 } };
+    int round_mode = copt.mode == GL_TRIANGLE_FAN || copt.mode == GL_LINE_LOOP;
     GLint n = 0;
 
     for (int l = 0; l < 16; l++)
@@ -1010,10 +1108,12 @@ static void corpus_attribs(GLuint prog)
                 type == GL_FLOAT_VEC3 || type == GL_FLOAT_MAT3 ? 3 : 4;
         printf("   attribute %s: type 0x%x, %d, location %d\n", name, type, size, loc);
         for (int c = 0; c < cols && loc >= 0 && loc + c < 16; c++) {
-            for (int k = 0; k < 3; k++)
+            for (int k = 0; k < copt.nverts; k++)
                 for (int j = 0; j < 4; j++)
-                    attr_data[loc + c][k][j] = !strcmp(name, "p") ? tri[k][j] :
-                        0.25f * (loc + c + 1) + 0.0625f * k + 0.015625f * j;
+                    attr_data[loc + c][k][j] = strcmp(name, "p") ?
+                        0.25f * (loc + c + 1) + 0.0625f * k + 0.015625f * j :
+                        copt.mode == GL_TRIANGLES ? tri[k][j] :
+                        round_mode ? round[k][j] : quad[k][j];
             glEnableVertexAttribArray(loc + c);
             glVertexAttribPointer(loc + c, comps, GL_FLOAT, GL_FALSE, 16, attr_data[loc + c]);
         }
@@ -1073,12 +1173,59 @@ static void corpus_uniforms(GLuint prog, GLuint tex2d, GLuint texcube)
     }
 }
 
+/* a w x h texture of the corpus's texels (texel i: (i & 3) * 64, (i >> 2) *
+ * 64 on a 4 x 4 -- the same pattern repeated), blue b */
+static void corpus_tex2d(GLuint tex, int w, int h, int mip, int linear, int b)
+{
+    unsigned char *t = malloc((size_t)w * h * 4);
+
+    for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++) {
+            unsigned char *q = t + (y * w + x) * 4;
+            q[0] = (x & 3) * 64;
+            q[1] = (y & 3) * 64;
+            q[2] = b;
+            q[3] = 255;
+        }
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, t);
+    if (mip)
+        glGenerateMipmap(GL_TEXTURE_2D);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
+                    mip ? (linear ? GL_LINEAR_MIPMAP_LINEAR : GL_NEAREST_MIPMAP_NEAREST) :
+                    linear ? GL_LINEAR : GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, linear ? GL_LINEAR : GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    free(t);
+}
+
+static void corpus_cube(GLuint tex, int n, int linear)
+{
+    unsigned char *t = malloc((size_t)n * n * 4);
+
+    glBindTexture(GL_TEXTURE_CUBE_MAP, tex);
+    for (int face = 0; face < 6; face++) {
+        for (int i = 0; i < n * n; i++) {
+            t[i * 4] = (i % n & 3) * 64;
+            t[i * 4 + 1] = (i / n & 3) * 64;
+            t[i * 4 + 2] = 40 * face;
+            t[i * 4 + 3] = 255;
+        }
+        glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + face, 0, GL_RGBA, n, n, 0, GL_RGBA,
+                     GL_UNSIGNED_BYTE, t);
+    }
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MIN_FILTER, linear ? GL_LINEAR : GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MAG_FILTER, linear ? GL_LINEAR : GL_NEAREST);
+    free(t);
+}
+
 static int corpus(int argc, char **argv)
 {
     static const char *vs0 = "attribute vec4 p; void main() { gl_Position = p; }";
     static const char *fs0 = "void main() { gl_FragColor = vec4(1.0); }";
     unsigned char texels[4 * 4 * 4];
-    GLuint tex2d, texcube, p0;
+    GLuint tex2d, tex2d_b, texcube, p0, depth;
     const char *out = argv[2];
     char path0[512];
     int n0;
@@ -1091,6 +1238,12 @@ static int corpus(int argc, char **argv)
         texels[i * 4 + 2] = 128;
         texels[i * 4 + 3] = 255;
     }
+    /* a depth buffer for the cases that test depth */
+    glGenRenderbuffers(1, &depth);
+    glBindRenderbuffer(GL_RENDERBUFFER, depth);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT16, 64, 64);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, depth);
+    glGenTextures(1, &tex2d_b);
     glGenTextures(1, &tex2d);
     glBindTexture(GL_TEXTURE_2D, tex2d);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 4, 4, 0, GL_RGBA, GL_UNSIGNED_BYTE, texels);
@@ -1140,6 +1293,20 @@ static int corpus(int argc, char **argv)
             printf("   no \"// fragment\" line in %s\n", argv[i]);
             continue;
         }
+        case_options(vs, &copt);
+        if (copt.mode != GL_TRIANGLES || copt.width || copt.blend || copt.depth ||
+            copt.tex_w != 4 || copt.tex_h != 4 || copt.tex_mip || copt.tex_linear ||
+            copt.cube_n != 4 || copt.cube_linear || copt.draws > 1 || copt.indexed)
+            printf("   drawn: mode 0x%x, %d vertices, width %g, blend %d, depth %d, tex2d %dx%d%s%s, "
+                   "cube %d%s, %d draws%s\n", copt.mode, copt.nverts, copt.width, copt.blend,
+                   copt.depth, copt.tex_w, copt.tex_h, copt.tex_mip ? " mip" : "",
+                   copt.tex_linear ? " linear" : "", copt.cube_n, copt.cube_linear ? " linear" : "",
+                   copt.draws, copt.indexed ? ", indexed" : "");
+        /* the textures as the case wants them, made before the pages are
+         * taken: their upload is not the draw's */
+        corpus_tex2d(tex2d, copt.tex_w, copt.tex_h, copt.tex_mip, copt.tex_linear, 128);
+        corpus_tex2d(tex2d_b, copt.tex_w, copt.tex_h, copt.tex_mip, copt.tex_linear, 32);
+        corpus_cube(texcube, copt.cube_n, copt.cube_linear);
         changed_pages(0, 0);	/* whatever happened since the last case */
         prog = link_logged(vs, fs);
         if (!prog)
@@ -1147,13 +1314,44 @@ static int corpus(int argc, char **argv)
         glUseProgram(prog);
         corpus_attribs(prog);
         corpus_uniforms(prog, tex2d, texcube);
+        if (copt.width)
+            glLineWidth(copt.width);
+        if (copt.blend) {
+            glEnable(GL_BLEND);
+            if (copt.blend == 2)
+                glBlendFunc(GL_ONE, GL_ONE);
+            else
+                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        }
+        if (copt.depth) {
+            glEnable(GL_DEPTH_TEST);
+            glDepthFunc(GL_LESS);
+            glDepthMask(GL_TRUE);
+        }
         glClearColor(0, 0, 0, 0);
-        glClear(GL_COLOR_BUFFER_BIT);
-        glDrawArrays(GL_TRIANGLES, 0, 3);
+        glClearDepthf(1.0f);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        for (int d = 0; d < copt.draws; d++) {
+            static const GLushort idx[8] = { 0, 1, 2, 3, 0, 2, 1, 3 };
+            if (copt.draws > 1) {
+                glActiveTexture(GL_TEXTURE0);
+                glBindTexture(GL_TEXTURE_2D, d & 1 ? tex2d_b : tex2d);
+            }
+            if (copt.indexed)
+                glDrawElements(copt.mode, copt.nverts, GL_UNSIGNED_SHORT, idx);
+            else
+                glDrawArrays(copt.mode, 0, copt.nverts);
+        }
         glFinish();
         glReadPixels(32, 32, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
+        if (copt.blend)
+            glDisable(GL_BLEND);
+        if (copt.depth)
+            glDisable(GL_DEPTH_TEST);
+        if (copt.width)
+            glLineWidth(1);
         snprintf(path, sizeof path, "%s/%s.pages", out, name);
-        n = changed_pages(path, 0);
+        n = changed_pages(path, copt.all_pages);
         printf("   drawn: GL error 0x%x, centre pixel %02x %02x %02x %02x, %d pages changed -> %s\n",
                glGetError(), px[0], px[1], px[2], px[3], n, path);
         ok++;

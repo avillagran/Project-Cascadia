@@ -2360,6 +2360,22 @@ The CPU's stream of vertices from an application's array laid out as the
 stream is (SDL's x y, r g b a, u v at stride 32) is one copy now, not a
 memset and a memcpy an attribute a vertex.
 
+**Captures for what is next** (iOS, `tools/shadercap.sh`): gltrace's
+corpus mode takes a case's way of drawing from its file now -- `// mode:`
+(points, lines, strips, fans), `// width:`, `// blend:`, `// depth:` (the
+target has a depth buffer), `// tex2d: W H [mip] [linear]`, `// cube: N
+[linear]`, `// draws: N` (another texture every other draw), `//
+indexed`, `// pages: all` (every page that is not zero, not only those that
+changed: t09's pixel PDS never showed in the changed ones). The new cases:
+`s00`..`s11` the PDS's texture fetch (SDL's own shader, highp and
+mediump coordinates, the colour varying first, two textures, `.zw`, a
+bias, a cube map, `texture2DProj`, lowp, three draws with the texture
+another each), `h00`..`h04` opaque, depth-tested, blended and punch-through
+draws (the ISP's pass types: hidden surface removal), `l00`..`l10` lines,
+strips, loops, wide lines, points (`gl_PointSize`, `gl_PointCoord`, a size
+an attribute), triangle strips and fans, indexed lines and triangles,
+`k00`..`k03` cube maps of 15 and 6, a 64 x 64 with every level, a 24 x 12.
+
 Release builds: `glspeed 1000 60 sprites` 49.5 -> 36.8 ms a frame (each
 waits for the GPU: both sides), 8 blended layers 53 -> 34.8 ms; SuperTux
 24.5 -> 26 fps, the GPU 24.7 ms of its frame. dEQP-GLES2 the same,
