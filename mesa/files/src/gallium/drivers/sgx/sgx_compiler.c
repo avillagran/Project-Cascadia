@@ -773,11 +773,9 @@ plan_inputs(struct comp *c, nir_function_impl *impl)
              c->fetch_only[slot] || c->input_of_slot[slot] >= 0 ||
              c->colour_of_slot[slot] >= 0 || c->ninputs == SGX_FRAME_MAX_VARYINGS)
             continue;
-         if (c->flat[slot]) {
-            if (c->ncolours == 2) {
-               fail(c, "more than two flat varyings");
-               return;
-            }
+         /* (two of the TA's colours: flat shading with two-sided colours
+          * besides has its back ones smooth) */
+         if (c->flat[slot] && c->ncolours < 2) {
             c->colour_slot[c->ncolours] = slot;
             c->colour_of_slot[slot] = c->ncolours++;
             continue;
@@ -2264,9 +2262,14 @@ compile_fs(const nir_shader *fs, const struct sgx_blend_key *blend, char *why,
    }
 
    s = nir_shader_clone(NULL, fs);
-   /* the flat-shaded varyings: the TA's colours (M37) */
+   /* the flat-shaded colours: the TA's (M37) -- GL's flat shading.  Not
+    * other varyings: the linker makes one flat whose value is the same at
+    * every vertex (piglit's glsl-sin: a uniform's sine), and the TA's
+    * colours are bytes; a varying the same everywhere comes out so smooth */
    nir_foreach_shader_in_variable(var, s) {
-      if (var->data.interpolation != INTERP_MODE_FLAT || var->data.location < 0)
+      if (var->data.interpolation != INTERP_MODE_FLAT ||
+          (var->data.location != VARYING_SLOT_COL0 && var->data.location != VARYING_SLOT_COL1 &&
+           var->data.location != VARYING_SLOT_BFC0 && var->data.location != VARYING_SLOT_BFC1))
          continue;
       for (unsigned i = 0; i < glsl_count_attribute_slots(var->type, false); i++)
          if (var->data.location + i < VARYING_SLOT_MAX)

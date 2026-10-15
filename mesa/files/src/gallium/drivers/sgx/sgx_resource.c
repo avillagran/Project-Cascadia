@@ -552,13 +552,15 @@ sgx_resource_linear(const struct sgx_resource *res, const struct pipe_sampler_st
       return false;
    /* (a size not a power of two is twiddled too, M28: the minification
     * filter is lost here) -- and, M37, one sampled with the nearest texel
-    * whether minified or magnified: nothing is lost then (dEQP's
-    * nearest_linear_clamp_*_npot went wrong linear), and no copy is made
-    * (glamor's masks, a new texture of the window's size at every step of
-    * a window dragged, were copied once each) */
+    * whether minified or magnified, clamped both ways: nothing is lost
+    * then (dEQP's nearest_linear_clamp_*_npot, piglit's texwrap 2d with
+    * repeat and mirror went wrong linear), and no copy is made (glamor's
+    * masks, a new texture of the window's size at every step of a window
+    * dragged, were copied once each) */
    return force == 1 || res->external || res->gpu_written ||
           (ss && ss->min_img_filter == PIPE_TEX_FILTER_NEAREST &&
-           ss->mag_img_filter == PIPE_TEX_FILTER_NEAREST);
+           ss->mag_img_filter == PIPE_TEX_FILTER_NEAREST &&
+           wrap_bits(ss->wrap_s) == 2 && wrap_bits(ss->wrap_t) == 2);
 }
 
 /* The levels a lookup through view with ss may take (M35): from *first
