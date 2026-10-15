@@ -74,7 +74,7 @@ struct sgx_transfer {
 /* Whether res is sampled as it is, linear (M16): a format the sampler has
  * (native_format(), M37), one level, written by the GPU or by others (a
  * render's target, a shared buffer) -- the CPU's copy would read it back
- * each time -- or sampled with ss's nearest texel when minified.
+ * each time -- or sampled with ss's nearest texel both ways.
  * Minification is point sampling then. */
 bool sgx_resource_linear(const struct sgx_resource *res, const struct pipe_sampler_state *ss);
 

@@ -277,7 +277,7 @@ unpack_row(enum pipe_format format, const uint8_t *line, unsigned w, uint32_t *r
  * pa0`).  0: not one of them -- made RGBA8 by util_format.  SGX_TEX_NATIVE=0:
  * none. */
 static unsigned
-native_format(enum pipe_format f, uint32_t *fmt, uint32_t *swizzle)
+native_format(const struct pipe_resource *p, uint32_t *fmt, uint32_t *swizzle)
 {
    static int on = -1;
 
@@ -287,7 +287,11 @@ native_format(enum pipe_format f, uint32_t *fmt, uint32_t *swizzle)
    *swizzle = 0;
    if (!on)
       return 0;
-   switch (util_format_linear(f)) {
+   /* (a cube map of one-byte texels: its faces are not where the 2 KiB
+    * rule puts them -- dEQP's size.cube.16x16_l8 -- made RGBA8) */
+   if (p->target == PIPE_TEXTURE_CUBE && util_format_get_blocksize(p->format) == 1)
+      return 0;
+   switch (util_format_linear(p->format)) {
    case PIPE_FORMAT_R8G8B8A8_UNORM: *fmt = 0x0c; *swizzle = 0; return 4;  /* ABGR */
    case PIPE_FORMAT_B8G8R8A8_UNORM: *fmt = 0x0c; *swizzle = 1; return 4;  /* ARGB */
    case PIPE_FORMAT_R8G8B8X8_UNORM: *fmt = 0x0c; *swizzle = 4; return 4;  /* 1BGR: iOS's RGB8 */
@@ -307,7 +311,7 @@ static unsigned
 copy_bytes(const struct sgx_resource *res)
 {
    uint32_t fmt, swizzle;
-   unsigned b = native_format(res->base.format, &fmt, &swizzle);
+   unsigned b = native_format(&res->base, &fmt, &swizzle);
 
    return b ? b : 4;
 }
@@ -325,7 +329,7 @@ copy_level(const struct sgx_resource *res, unsigned level, unsigned face_layer, 
    const uint8_t *src = (const uint8_t *)res->bo->map + res->offset[level] +
                         face_layer * res->layer_size[level];
    uint32_t fmt, swizzle;
-   unsigned native = native_format(p->format, &fmt, &swizzle);
+   unsigned native = native_format(p, &fmt, &swizzle);
    /* the columns of content the box reads (padding: the last one) */
    unsigned cx0 = scale ? 0 : MIN2(x0, lw - 1), cx1 = scale ? lw : MAX2(MIN2(x1, lw), cx0 + 1);
    unsigned bytes = util_format_get_blocksize(p->format);
@@ -537,18 +541,20 @@ sgx_resource_linear(const struct sgx_resource *res, const struct pipe_sampler_st
    if (force < 0)
       force = getenv("SGX_LINEAR_TEX") ? atoi(getenv("SGX_LINEAR_TEX")) : 2;
    /* SGX_LINEAR_TEX=0: never, 1: whenever it can */
-   if (force == 0 || !native_format(p->format, &fmt, &swizzle) || p->last_level ||
+   if (force == 0 || !native_format(p, &fmt, &swizzle) || p->last_level ||
        p->array_size > 1 || (res->stride[0] & 15) || res->stride[0] < 32 ||
        ((res->offset[0] + res->bo->va) & 15) ||
        (p->target != PIPE_TEXTURE_2D && p->target != PIPE_TEXTURE_RECT))
       return false;
    /* (a size not a power of two is twiddled too, M28: the minification
     * filter is lost here) -- and, M37, one sampled with the nearest texel
-    * when minified: nothing is lost then, and no copy is made (glamor's
-    * masks, a new texture of the window's size at every step of a window
-    * dragged, were copied once each) */
+    * whether minified or magnified: nothing is lost then (dEQP's
+    * nearest_linear_clamp_*_npot went wrong linear), and no copy is made
+    * (glamor's masks, a new texture of the window's size at every step of
+    * a window dragged, were copied once each) */
    return force == 1 || res->external || res->gpu_written ||
-          (ss && ss->min_img_filter == PIPE_TEX_FILTER_NEAREST);
+          (ss && ss->min_img_filter == PIPE_TEX_FILTER_NEAREST &&
+           ss->mag_img_filter == PIPE_TEX_FILTER_NEAREST);
 }
 
 /* The levels a lookup through view with ss may take (M35): from *first
@@ -598,7 +604,7 @@ sgx_resource_texture(struct sgx_context *ctx, struct sgx_resource *res,
        * are for twiddled textures is lost: point sampling.  Type 6 (GXM's
        * linear strided), the format and its swizzle as a copy's (M37: the
        * sampler reads B G R A by swizzle 1, ARGB, not by itself) */
-      native_format(p->format, &fmt, &swizzle);
+      native_format(p, &fmt, &swizzle);
       words[0] = (res->stride[0] / 16 - 2) << 16 | (sampler_bits(ss) & ~0xe00u) | 7u << 9;
       words[1] = 6u << 29 | fmt << 24 | (p->width0 - 1) << 12 | (p->height0 - 1);
       words[2] = res->bo->va + res->offset[0];
@@ -627,7 +633,7 @@ sgx_resource_texture(struct sgx_context *ctx, struct sgx_resource *res,
        * t04, 0x4c020002 -- 5 twiddled of any size, 6 strided: GXM's
        * SceGxmTextureType), the format in 28:24, the size: log2 w in 19:16
        * and log2 h in 3:0, or w - 1 in 23:12 and h - 1 in 11:0 */
-      native_format(p->format, &fmt, &swizzle);
+      native_format(p, &fmt, &swizzle);
       if (cube || (util_is_power_of_two_nonzero(w) && util_is_power_of_two_nonzero(h)))
          words[1] = (cube ? 2u << 29 : 0) | fmt << 24 |
                     util_logbase2(res->tw_w) << 16 | util_logbase2(res->tw_h);
