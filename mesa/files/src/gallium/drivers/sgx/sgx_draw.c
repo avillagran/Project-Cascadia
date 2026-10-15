@@ -806,6 +806,7 @@ sgx_batch_flush_at(struct sgx_context *ctx, const char *file, int line)
    struct sgx_frame_draw *d = b->fdraw;
    struct sgx_resource *zs = b->zs ? sgx_resource(b->zs) : NULL;
    struct sgx_frame_zls zls = { 0 };
+   struct sgx_bo *vis = NULL;
    struct sgx_fence *fence;
    int ret = -ENOMEM;
 
@@ -874,14 +875,26 @@ sgx_batch_flush_at(struct sgx_context *ctx, const char *file, int line)
    /* the buffers to list: the textures', then the buffers' */
    for (unsigned i = 0; i < b->nbos; i++)
       b->handles[b->ntex + i] = b->bos[i]->handle;
+   /* an occlusion query's draws among them (M37): a visibility buffer of
+    * the render's, zeroed, for the query to read */
+   if (b->counted && ctx->query && (vis = sgx_bo_cache_get(&screen->dev, SGX_VIS_SIZE)))
+      memset(vis->map, 0, SGX_VIS_SIZE);
    if ((fence = sgx_fence_create(&screen->dev, false))) {
       simple_mtx_lock(&screen->frame_lock);
       const struct sgx_frame_target t = { sgx_resource(b->rt), b->rt_level, b->rt_layer };
 
       ret = sgx_frame_render(screen->frame, &t, d, b->ndraws, b->handles,
-                             b->ntex + b->nbos, b->depth_clear, zls.bo ? &zls : NULL, fence);
+                             b->ntex + b->nbos, b->depth_clear, zls.bo ? &zls : NULL, vis,
+                             fence);
       simple_mtx_unlock(&screen->frame_lock);
    }
+   if (vis && !ret) {
+      sgx_bo_set_busy(vis, fence);
+      sgx_query_add(ctx->query, vis);
+   } else {
+      sgx_bo_destroy(vis);
+   }
+   b->counted = false;
    if (!ret && ctx->debug_fps) {
       unsigned i;
 
@@ -1158,6 +1171,8 @@ note_zs(struct sgx_context *ctx, const struct sgx_frame_state *st)
 {
    struct sgx_batch *b = &ctx->batch;
 
+   /* (and an occlusion query's draw: the render counts, M37) */
+   b->counted |= st->count;
    if (!ctx->fb.zsbuf.texture)
       return;
    b->zs_written |= st->depth_write || (st->stencil_on && (st->stencil & 0xff));
@@ -1342,6 +1357,8 @@ submit(struct sgx_context *ctx)
    struct sgx_frame_state st = {
       .depth_func = ctx->dsa && ctx->dsa->depth_enabled ? ctx->dsa->depth_func : PIPE_FUNC_ALWAYS,
       .depth_write = ctx->dsa && ctx->dsa->depth_enabled && ctx->dsa->depth_writemask,
+      /* an occlusion query's samples (M37) */
+      .count = ctx->query && !ctx->queries_off,
    };
 
    /* the stencil test (M23): ISP state B -- compare in 27:25 (as the depth

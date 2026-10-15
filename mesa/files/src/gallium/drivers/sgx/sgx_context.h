@@ -63,6 +63,25 @@ struct sgx_batch_draw {
    bool repacked;
 };
 
+/* An occlusion query (M37): the renders made while it was active, each
+ * with a visibility buffer of its own -- the samples its draws passed, a
+ * word a core (sgx_frame_render's vis) -- and what those read already came
+ * to.  A render goes at each begin and end: the ISP has one count. */
+#define SGX_QUERY_BUFS 16
+struct sgx_query {
+   unsigned type;                       /* PIPE_QUERY_OCCLUSION_* */
+   struct sgx_bo *bo[SGX_QUERY_BUFS];
+   unsigned nbo;
+   uint64_t samples;
+   /* the last render made before its end: its result is there when every
+    * render before is done, its own or not (piglit's occlusion_query_order:
+    * a query with no draws after others) */
+   struct sgx_fence *last;
+};
+
+/* a render's visibility buffer for q, busy with it (sgx_batch_flush) */
+void sgx_query_add(struct sgx_query *q, struct sgx_bo *bo);
+
 struct sgx_batch {
    struct pipe_resource *rt;            /* referenced */
    unsigned rt_level, rt_layer;         /* its level and face (M29) */
@@ -74,6 +93,7 @@ struct sgx_batch {
    struct pipe_resource *zs;            /* the depth buffer, referenced (M24) */
    bool zs_cleared;                     /* its depth cleared at the render's start */
    bool zs_read, zs_written;            /* a draw tests depth, writes it */
+   bool counted;                        /* a draw's samples counted (M37) */
    float *verts;
    unsigned nfloats, maxfloats;
    uint8_t *vdata;                      /* vertex shaders' vertices made one stream */
@@ -173,6 +193,8 @@ struct sgx_context {
    struct sgx_pixel_program colour_prog; /* o0 = sa0: sgx_colour_clear() */
    uint64_t colour_code[2];
    struct sgx_batch batch;
+   struct sgx_query *query;             /* the active occlusion query (M37) */
+   bool queries_off;                    /* (set_active_query_state: meta ops) */
    const float *fs_constants;
    unsigned fs_constants_size;  /* bytes */
    bool warned_fs, debug_draw;

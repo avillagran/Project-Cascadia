@@ -2,7 +2,8 @@
  * (docs/research/p105-mesa.md, M35, M36): a 1D texture, sRGB textures (RGBA
  * and luminance, decoded or not), a rectangle texture (unnormalized
  * coordinates), the fixed-function pipeline (glBegin and client arrays, a
- * texture modulated by the vertex colour), flat shading and logic ops (M37).  A 64 x 64 target, every pixel
+ * texture modulated by the vertex colour), flat shading, occlusion queries
+ * and logic ops (M37).  A 64 x 64 target, every pixel
  * read back against what C works out.
  *
  *   sgx-gl gldesk [CASE]        (CASE: a name's start; all by default)
@@ -317,6 +318,15 @@ main(int argc, char **argv)
 	glGenFramebuffers(1, &fbo);
 	glBindFramebuffer(GL_FRAMEBUFFER, fbo);
 	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, rt, 0);
+	/* (a depth buffer: the occlusion queries' quad behind another) */
+	{
+		GLuint zs;
+
+		glGenRenderbuffers(1, &zs);
+		glBindRenderbuffer(GL_RENDERBUFFER, zs);
+		glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, W, H);
+		glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, zs);
+	}
 	if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
 		return fprintf(stderr, "gldesk: the target is not complete\n"), 2;
 	glViewport(0, 0, W, H);
@@ -433,6 +443,117 @@ main(int argc, char **argv)
 		flat_case("flat shading, textured");
 		flat_tex = 0;
 		glDisable(GL_TEXTURE_2D);
+	}
+	/* occlusion queries (M37): the samples a quad passes -- all of its
+	 * 48 x 32 pixels, half of them discarded, none behind another, and two
+	 * queries one after the other */
+	if (!only || !strncmp("occlusion", only, strlen(only))) {
+		static const float quad[] = { -0.5f, -0.5f, 1, -0.5f, -0.5f, 0.5f, 1, 0.5f };
+		/* (known: a discarded pixel is counted -- discard keeps the tile's
+		 * colour, the ISP passes it, M19) */
+		static const struct { const char *name, *body; int behind, want, known, masked; } q[] = {
+			{ "occlusion query, a quad", "gl_FragColor = vec4(1.0);", 0, 48 * 32, 0 },
+			{ "occlusion query, nothing written", "gl_FragColor = vec4(1.0);", 0, 48 * 32, 0, 1 },
+			{ "occlusion query, a third discarded",
+			  "if (v.x < 0.5) discard; gl_FragColor = vec4(1.0);", 0, 32 * 32, 1 },
+			{ "occlusion query, behind", "gl_FragColor = vec4(1.0);", 1, 0, 0 },
+		};
+		GLuint ids[4];
+
+		glGenQueries(4, ids);
+		glEnable(GL_DEPTH_TEST);
+		glDepthFunc(GL_LESS);
+		for (int i = 0; i < 4; i++) {
+			GLuint p = program(q[i].body), n = ~0u;
+
+			cases++;
+			if (!only || !strncmp(q[i].name, only, strlen(only))) {
+				glClear(GL_COLOR_BUFFER_BIT);
+				/* a quad in front, all over the target, for the third to be behind */
+				glDepthMask(GL_TRUE);
+				glClearDepth(1.0);
+				glClear(GL_DEPTH_BUFFER_BIT);
+				if (q[i].behind) {
+					static const float all[] = { -1, -1, 1, -1, -1, 1, 1, 1 };
+
+					glEnableVertexAttribArray(0);
+					glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, all);
+					glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+				}
+				/* (the colour and depth masked: piglit's conform cases) */
+				if (q[i].masked) {
+					glColorMask(0, 0, 0, 0);
+					glDepthMask(GL_FALSE);
+				}
+				glBeginQuery(GL_SAMPLES_PASSED, ids[i]);
+				glEnableVertexAttribArray(0);
+				glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, quad);
+				glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+				glEndQuery(GL_SAMPLES_PASSED);
+				glColorMask(1, 1, 1, 1);
+				glDepthMask(GL_TRUE);
+				glDisableVertexAttribArray(0);
+				glGetQueryObjectuiv(ids[i], GL_QUERY_RESULT, &n);
+			}
+			if (n == (GLuint)q[i].want) {
+				printf("%-36s ok   : %u samples\n", q[i].name, n);
+			} else if (q[i].known) {
+				printf("%-36s known: %u samples, want %d\n", q[i].name, n, q[i].want);
+			} else {
+				failed++;
+				printf("%-36s WRONG: %u samples, want %d\n", q[i].name, n, q[i].want);
+			}
+			glUseProgram(0);
+			glDeleteProgram(p);
+		}
+		glDeleteQueries(4, ids);
+		glDisable(GL_DEPTH_TEST);
+	}
+	/* piglit's occlusion_query_conform GetObjivAval_multi2: an occluder,
+	 * then behind it a quad larger, one a little larger and one smaller,
+	 * nothing written -- fewer samples each, none for the last */
+	if (!only || !strncmp("occlusion query, three behind", only, strlen(only))) {
+		static const float r[4] = { 0.5f, 0.7f, 0.53f, 0.4f };
+		GLuint ids[3], n[3];
+
+		glGenQueries(3, ids);
+		glEnable(GL_DEPTH_TEST);
+		glDepthFunc(GL_LESS);
+		glClearDepth(1.0);
+		glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+		glMatrixMode(GL_PROJECTION);
+		glLoadIdentity();
+		glOrtho(-1, 1, -1, 1, 0, 25);
+		glMatrixMode(GL_MODELVIEW);
+		glLoadIdentity();
+		glTranslatef(0, 0, -10);
+		glColor3f(1, 0, 0);
+		glRectf(-r[0], -r[0], r[0], r[0]);
+		glTranslatef(0, 0, -5);
+		glColorMask(0, 0, 0, 0);
+		glDepthMask(GL_FALSE);
+		for (int i = 0; i < 3; i++) {
+			glBeginQuery(GL_SAMPLES_PASSED, ids[i]);
+			glRectf(-r[i + 1], -r[i + 1], r[i + 1], r[i + 1]);
+			glEndQuery(GL_SAMPLES_PASSED);
+		}
+		for (int i = 0; i < 3; i++)
+			glGetQueryObjectuiv(ids[i], GL_QUERY_RESULT, &n[i]);
+		glColorMask(1, 1, 1, 1);
+		glDepthMask(GL_TRUE);
+		glLoadIdentity();
+		glMatrixMode(GL_PROJECTION);
+		glLoadIdentity();
+		glDisable(GL_DEPTH_TEST);
+		glDeleteQueries(3, ids);
+		/* (known: with depth writes off the ISP counts samples the depth
+		 * test fails too -- about half of those; drawn right) */
+		cases++;
+		if (n[0] > n[1] && n[1] > n[2] && !n[2])
+			printf("%-36s ok   : %u %u %u samples\n", "occlusion query, three behind", n[0], n[1], n[2]);
+		else
+			printf("%-36s known: %u %u %u samples, the last 0 wanted\n",
+			       "occlusion query, three behind", n[0], n[1], n[2]);
 	}
 	logic_check("a logic op, xor", 0xf, 0);
 	logic_check("a logic op, red and blue masked in", 0x5, 0);

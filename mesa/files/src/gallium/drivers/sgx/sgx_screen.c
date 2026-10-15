@@ -242,6 +242,7 @@ sgx_init_screen_caps(struct pipe_screen *pscreen)
    caps->fs_face_is_integer_sysval = true;
    caps->texture_transfer_modes = 0;
    caps->shareable_shaders = false;
+   caps->occlusion_query = true;     /* M37: ISP state A bit 14 (sgx_context.c) */
    caps->alpha_test = false;
    caps->flatshade = false;
    caps->two_sided_color = false;

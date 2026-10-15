@@ -173,6 +173,9 @@ struct sgx_frame_state {
     * gloffset --probe); a unit is 32 of 24-bit depth's at depths 0.5..1
     * (a power of two smaller below: floating point) */
    uint32_t offset;
+   /* (M37) the samples that pass counted: an occlusion query's draw (ISP
+    * state A bit 14, iOS's m29; bit 18 would count only whether any did) */
+   bool count;
 };
 #define SGX_FLAT_LAST  3
 /* the TA's culling (state word 18, bits 1:0): the triangles clockwise or
@@ -227,6 +230,7 @@ sgx_frame_state_equal(const struct sgx_frame_state *x, const struct sgx_frame_st
           x->viewport == y->viewport && x->cull == y->cull &&
           x->stencil_on == y->stencil_on && x->stencil == y->stencil &&
           x->stencil_ref == y->stencil_ref && x->flat == y->flat && x->offset == y->offset &&
+          x->count == y->count &&
           (!x->viewport || (x->scale[0] == y->scale[0] && x->scale[1] == y->scale[1] &&
                             x->scale[2] == y->scale[2] && x->translate[0] == y->translate[0] &&
                             x->translate[1] == y->translate[1] &&
@@ -277,10 +281,15 @@ uint32_t sgx_frame_zls_size(unsigned w, unsigned h);
  * render reads besides rt and the frame's buffers -- its stream, the
  * draws' state, vertices and indices -- goes in memory of its own (M27):
  * it need not wait for the renders before it. */
+/* (M37) vis: where the ISP counts the samples that pass of the draws whose
+ * state says so (an occlusion query's), or NULL -- a word for each core,
+ * SGX_VIS_CORE_STRIDE apart, the buffer zeroed beforehand */
+#define SGX_VIS_CORE_STRIDE 0x640
+#define SGX_VIS_SIZE (SGX_VIS_CORE_STRIDE + 4)
 int sgx_frame_render(struct sgx_frame *f, const struct sgx_frame_target *t,
                      const struct sgx_frame_draw *draws, unsigned n, const uint32_t *handles,
                      unsigned nhandles, float depth_clear, const struct sgx_frame_zls *zls,
-                     struct sgx_fence *done);
+                     struct sgx_bo *vis, struct sgx_fence *done);
 /* the most vertices a draw module draw (l) takes: sgx_frame_draw's, and a
  * gathered render's without indices */
 unsigned sgx_frame_max_vertices(struct sgx_frame *f, const struct sgx_frame_layout *l);

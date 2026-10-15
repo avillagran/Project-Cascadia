@@ -1409,11 +1409,11 @@ zls_ctl(const struct sgx_frame_zls *zls)
  * draws read besides */
 static int
 kick(struct sgx_frame *f, const struct sgx_frame_target *t, float depth,
-     const struct sgx_frame_zls *zls, const uint32_t *handles, unsigned nhandles, uint32_t vdm,
-     const struct own *o, struct sgx_fence *done)
+     const struct sgx_frame_zls *zls, struct sgx_bo *vis, const uint32_t *handles,
+     unsigned nhandles, uint32_t vdm, const struct own *o, struct sgx_fence *done)
 {
    struct sgx_eot to = target_eot(t);
-   uint32_t hs[MAX_PACK_BOS + 3 + 2 + 1 + SGX_FRAME_MAX_HANDLES + ARENA_MAX];
+   uint32_t hs[MAX_PACK_BOS + 3 + 2 + 1 + 1 + SGX_FRAME_MAX_HANDLES + ARENA_MAX];
    uint32_t cmd[APPLE_SGX_TA_CMD_MAX / 4];
    const uint32_t *pack = f->built ? f->cmd_tmpl :
                           (const uint32_t *)cpu_at(f, f->kick[2], APPLE_SGX_TA_CMD_MIN, NULL);
@@ -1483,6 +1483,16 @@ kick(struct sgx_frame *f, const struct sgx_frame_target *t, float depth,
       b[0x74 / 4] = zls ? zls->bo->va - base : 0;
       if (zls)
          hs[n++] = zls->bo->handle;
+   }
+   /* the visibility buffer (M37): what iOS's GL hands the kext as payload
+    * words 42 and 43 (m29), the 3D block's first two words -- core 0's
+    * count at the buffer, core 1's SGX_VIS_CORE_STRIDE further */
+   if (vis) {
+      uint32_t *b = (uint32_t *)(blk - 0x80);
+
+      b[0] = vis->va;
+      b[1] = vis->va + SGX_VIS_CORE_STRIDE;
+      hs[n++] = vis->handle;
    }
    /* the stream: the render's own (M27), or the frame's */
    if (vdm)
@@ -2111,7 +2121,7 @@ render(struct sgx_frame *f, struct sgx_resource *rt, const struct sgx_frame_layo
          mesa_logi("sgx:   VDM +%02x: %08x %08x %08x %08x %08x", i * 4, vdm[i], vdm[i + 1],
                    vdm[i + 2], vdm[i + 3], vdm[i + 4]);
    }
-   return kick(f, &t, 1.0f, NULL, handles, nhandles, 0, NULL, done);
+   return kick(f, &t, 1.0f, NULL, NULL, handles, nhandles, 0, NULL, done);
 }
 
 int
@@ -2260,8 +2270,8 @@ draw_state(struct sgx_frame *f, const struct sgx_frame_draw *d, const struct sgx
    state_size(full, to->w, to->h);
    /* ISP state B: the depth compare in bits 24:22, bit 20 set when depth
     * is not written */
-   full[1] = (full[1] & ~(7u << 22 | 1u << 20)) | (uint32_t)(d->st.depth_func & 7) << 22 |
-             (d->st.depth_write ? 0 : 1u << 20);
+   full[1] = (full[1] & ~(7u << 22 | 1u << 20 | 1u << 14)) | (uint32_t)(d->st.depth_func & 7) << 22 |
+             (d->st.depth_write ? 0 : 1u << 20) | (d->st.count ? 1u << 14 : 0);
    full[18] = (full[18] & ~3u) | d->st.cull;
    full[2] = (full[2] & ~(0x3ffu << 16)) | d->st.offset;
    if (d->st.stencil_on) {
@@ -2333,7 +2343,7 @@ int
 sgx_frame_render(struct sgx_frame *f, const struct sgx_frame_target *t,
                  const struct sgx_frame_draw *draws, unsigned n, const uint32_t *handles,
                  unsigned nhandles, float depth_clear, const struct sgx_frame_zls *zls,
-                 struct sgx_fence *done)
+                 struct sgx_bo *vis, struct sgx_fence *done)
 {
    uint32_t full[32], prog[16], bg[4], eot, *v = f->vdmbuf, state_at = 0, ub_at = 0, vdm;
    unsigned total = 0, ub_rows = 0;
@@ -2461,7 +2471,7 @@ sgx_frame_render(struct sgx_frame *f, const struct sgx_frame_target *t,
       mesa_logi("sgx: a render of %u draws, %u vertices, into %ux%u at 0x%08x (end of tile "
                 "0x%08x), its own memory %u chunks%s", n, total, to.w, to.h, to.va, eot,
                 f->arena.n, o ? "" : " (the frame's words: after the last render)");
-   ret = kick(f, t, depth_clear, zls, handles, nhandles, vdm, o, done);
+   ret = kick(f, t, depth_clear, zls, vis, handles, nhandles, vdm, o, done);
    if (!ret) {
       sgx_fence_reference(&f->queued[f->nqueued++ % MAX_QUEUED], done);
       for (unsigned i = 0; i < f->arena.n; i++)

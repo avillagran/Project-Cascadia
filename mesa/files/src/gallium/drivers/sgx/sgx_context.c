@@ -11,6 +11,7 @@
  */
 #include "sgx_context.h"
 
+#include <string.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -169,6 +170,126 @@ sgx_flush(struct pipe_context *pctx, struct pipe_fence_handle **fence, unsigned 
       f = sgx_fence_create(&sgx_screen(pctx->screen)->dev, true);
    sgx_fence_reference((struct sgx_fence **)fence, NULL);
    *fence = (struct pipe_fence_handle *)f;
+}
+
+/* ---- occlusion queries (M37) ---------------------------------------------
+ *
+ * iOS's m29: ISP state A bit 14 makes the ISP count the samples a draw
+ * passes, into the visibility buffer the 3D block's first two words name
+ * (the kext's from GL's payload words 42 and 43), a word for each core.  No
+ * bit picks one of several counts (bits 15..23 tried: the object's type,
+ * the depth test), so a render goes at each begin and end, and each render
+ * a query was active in has a buffer of its own: the query's result is
+ * theirs added up. */
+static void
+query_fold(struct sgx_query *q, unsigned i)
+{
+   struct sgx_bo *bo = q->bo[i];
+   const uint32_t *w = (const uint32_t *)bo->map;
+
+   sgx_bo_wait(bo, -1);
+   q->samples += w[0] + w[SGX_VIS_CORE_STRIDE / 4];
+   sgx_bo_destroy(bo);
+}
+
+void
+sgx_query_add(struct sgx_query *q, struct sgx_bo *bo)
+{
+   /* (a query over many renders: the oldest read now) */
+   if (q->nbo == SGX_QUERY_BUFS) {
+      query_fold(q, 0);
+      memmove(q->bo, q->bo + 1, --q->nbo * sizeof(q->bo[0]));
+   }
+   q->bo[q->nbo++] = bo;
+}
+
+static void
+query_release(struct sgx_query *q)
+{
+   for (unsigned i = 0; i < q->nbo; i++)
+      sgx_bo_destroy(q->bo[i]);
+   q->nbo = 0;
+   sgx_fence_reference(&q->last, NULL);
+}
+
+static struct pipe_query *
+sgx_create_query(struct pipe_context *pctx, unsigned type, unsigned index)
+{
+   struct sgx_query *q;
+
+   if (type != PIPE_QUERY_OCCLUSION_COUNTER && type != PIPE_QUERY_OCCLUSION_PREDICATE &&
+       type != PIPE_QUERY_OCCLUSION_PREDICATE_CONSERVATIVE)
+      return NULL;
+   if (!(q = CALLOC_STRUCT(sgx_query)))
+      return NULL;
+   q->type = type;
+   return (struct pipe_query *)q;
+}
+
+static void
+sgx_destroy_query(struct pipe_context *pctx, struct pipe_query *pq)
+{
+   struct sgx_context *ctx = sgx_context(pctx);
+   struct sgx_query *q = (struct sgx_query *)pq;
+
+   if (ctx->query == q) {
+      sgx_batch_flush(ctx);
+      ctx->query = NULL;
+   }
+   query_release(q);
+   FREE(q);
+}
+
+static bool
+sgx_begin_query(struct pipe_context *pctx, struct pipe_query *pq)
+{
+   struct sgx_context *ctx = sgx_context(pctx);
+   struct sgx_query *q = (struct sgx_query *)pq;
+
+   sgx_batch_flush(ctx);
+   query_release(q);
+   q->samples = 0;
+   ctx->query = q;
+   return true;
+}
+
+static bool
+sgx_end_query(struct pipe_context *pctx, struct pipe_query *pq)
+{
+   struct sgx_context *ctx = sgx_context(pctx);
+
+   sgx_batch_flush(ctx);
+   if (ctx->query == (struct sgx_query *)pq)
+      ctx->query = NULL;
+   sgx_fence_reference(&((struct sgx_query *)pq)->last, ctx->last);
+   return true;
+}
+
+static bool
+sgx_get_query_result(struct pipe_context *pctx, struct pipe_query *pq, bool wait,
+                     union pipe_query_result *result)
+{
+   struct sgx_query *q = (struct sgx_query *)pq;
+
+   if (q->last && !sgx_fence_wait(q->last, wait ? OS_TIMEOUT_INFINITE : 0))
+      return false;
+   for (unsigned i = 0; i < q->nbo; i++)
+      if (!wait && !sgx_bo_idle(q->bo[i]))
+         return false;
+   for (unsigned i = 0; i < q->nbo; i++)
+      query_fold(q, i);
+   q->nbo = 0;
+   if (q->type == PIPE_QUERY_OCCLUSION_COUNTER)
+      result->u64 = q->samples;
+   else
+      result->b = q->samples != 0;
+   return true;
+}
+
+static void
+sgx_set_active_query_state(struct pipe_context *pctx, bool enable)
+{
+   sgx_context(pctx)->queries_off = !enable;
 }
 
 /* ---- clears ------------------------------------------------------------- */
@@ -823,6 +944,12 @@ sgx_context_create(struct pipe_screen *pscreen, void *priv, unsigned flags)
    p->texture_barrier = sgx_texture_barrier;
    p->memory_barrier = sgx_memory_barrier;
    p->get_device_reset_status = sgx_get_device_reset_status;
+   p->create_query = sgx_create_query;
+   p->destroy_query = sgx_destroy_query;
+   p->begin_query = sgx_begin_query;
+   p->end_query = sgx_end_query;
+   p->get_query_result = sgx_get_query_result;
+   p->set_active_query_state = sgx_set_active_query_state;
    p->resource_release = u_default_resource_release;
 
    p->create_blend_state = sgx_create_blend_state;
