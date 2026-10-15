@@ -302,10 +302,28 @@ render_index(struct sgx_render *sr, unsigned index)
                ctx->verts + ctx->nverts++ * vf);
 }
 
+/* (M37) flat colours from a triangle's first vertex (ARB_provoking_vertex):
+ * the TSP takes its last one's whatever state word 18 says (gldesk), so
+ * each triangle is turned round to end with it -- the winding the same */
+static bool
+flat_first(const struct sgx_context *ctx)
+{
+   return ctx->draw_fs && ctx->draw_fs->prog.ncolours && ctx->rast &&
+          ctx->rast->flatshade_first;
+}
+
+/* the i-th vertex of a list of triangles, turned (b, c, a) or not */
+static inline unsigned
+turned(unsigned i, bool turn)
+{
+   return turn ? i - i % 3 + (i % 3 + 1) % 3 : i;
+}
+
 static void
 render_draw_elements(struct vbuf_render *r, const uint16_t *indices, unsigned n)
 {
    struct sgx_render *sr = sgx_render(r);
+   bool turn = flat_first(sr->ctx);
 
    if (sr->prim != MESA_PRIM_TRIANGLES) {
       mesa_logw_once("sgx: %s left over by the draw module: dropped",
@@ -313,7 +331,7 @@ render_draw_elements(struct vbuf_render *r, const uint16_t *indices, unsigned n)
       return;
    }
    for (unsigned i = 0; i < n - n % 3; i++)
-      render_index(sr, indices[i]);
+      render_index(sr, indices[turned(i, turn)]);
 }
 
 static void
@@ -327,7 +345,7 @@ render_draw_arrays(struct vbuf_render *r, unsigned start, unsigned n)
       return;
    }
    for (unsigned i = 0; i < n - n % 3; i++)
-      render_index(sr, start + i);
+      render_index(sr, start + turned(i, flat_first(sr->ctx)));
 }
 
 static void
@@ -424,6 +442,7 @@ update_vertex_info(struct sgx_context *ctx)
       ctx->layout.nvaryings = fs->prog.nvaryings;
       ctx->layout.f32 = (1u << fs->prog.nvaryings) - 1;
       ctx->layout.colour = 0;
+      ctx->layout.ncolours = fs->prog.ncolours;
       return;
    }
    for (unsigned i = 0; c && c->ok && i < 4; i++) {
@@ -1169,7 +1188,8 @@ merge_vs_draw(struct sgx_context *ctx, struct sgx_vs *vs, const struct sgx_fs *f
        (fs && (p->prog.code_va != fs->prog.code_va || p->prog.pds_va != fs->prog.pds_va ||
                !sgx_words_equal(b->sa + p->sa, sa, nsa))) ||
        p->l.nvaryings != ctx->layout.nvaryings || p->l.f32 != ctx->layout.f32 ||
-       p->l.colour != ctx->layout.colour || !sgx_frame_state_equal(&p->st, st) ||
+       p->l.colour != ctx->layout.colour || p->l.ncolours != ctx->layout.ncolours ||
+       !sgx_frame_state_equal(&p->st, st) ||
        p->vs_sa + nvsa > b->nsa || !sgx_words_equal(b->sa + p->vs_sa, ctx->vs_sa, nvsa))
       return false;
 
@@ -1370,6 +1390,10 @@ submit(struct sgx_context *ctx)
       else if (r->cull_face == PIPE_FACE_FRONT)
          st.cull = r->front_ccw ? SGX_CULL_CCW : SGX_CULL_CW;
    }
+   /* flat shading (M37): iOS's word (the first vertex's colours by the
+    * triangles turned round: flat_first()) */
+   if (fs && fs->prog.ncolours)
+      st.flat = SGX_FLAT_LAST;
    if (ctx->debug_draw && !vs) {
       mesa_logi("sgx: %u triangles; the first:", ctx->nverts / 3);
       for (unsigned i = 0; i < MIN2(ctx->nverts, 3); i++) {
@@ -1772,7 +1796,7 @@ gpu_vs_can_draw(struct sgx_context *ctx, const struct pipe_draw_info *info)
    if (info->primitive_restart || info->instance_count != 1 ||
        r->cull_face == PIPE_FACE_FRONT_AND_BACK ||
        r->fill_front != PIPE_POLYGON_MODE_FILL || r->fill_back != PIPE_POLYGON_MODE_FILL ||
-       r->clip_plane_enable || r->flatshade ||
+       r->clip_plane_enable ||
        /* polygon offset: the draw module's (the TA's not found yet) */
        ((r->offset_tri || r->offset_point || r->offset_line) &&
         (r->offset_units != 0.0f || r->offset_scale != 0.0f)))
@@ -1912,7 +1936,7 @@ gpu_vs_draw(struct sgx_context *ctx, const struct pipe_draw_info *info,
    v->count = 3 * ntri;
    v->max_index = hi - vtx0;
    v->indexed = info->index_size || info->mode != MESA_PRIM_TRIANGLES ||
-                v->count > sgx_frame_list_max(screen->frame);
+                v->count > sgx_frame_list_max(screen->frame) || flat_first(ctx);
    if (v->indexed) {
       if (v->count > ctx->maxindices) {
          uint16_t *p = realloc(ctx->indices, v->count * sizeof(uint16_t));
@@ -1932,6 +1956,15 @@ gpu_vs_draw(struct sgx_context *ctx, const struct pipe_draw_info *info,
             k[0] = t + (t & 1), k[1] = t + 1 - (t & 1), k[2] = t + 2;
          } else {
             k[0] = 0, k[1] = t + 1, k[2] = t + 2;
+         }
+         /* the first vertex's colours (ARB_provoking_vertex's: a strip's
+          * triangle t takes vertex t's, a fan's vertex t + 1's) last */
+         if (flat_first(ctx)) {
+            unsigned p = info->mode == MESA_PRIM_TRIANGLES ||
+                         (info->mode == MESA_PRIM_TRIANGLE_STRIP && !(t & 1)) ? 0 : 1;
+            unsigned a = k[(p + 1) % 3], b = k[(p + 2) % 3], c = k[p];
+
+            k[0] = a, k[1] = b, k[2] = c;
          }
          for (unsigned i = 0; i < 3; i++) {
             if (indices)
@@ -2071,6 +2104,7 @@ gpu_vs_draw(struct sgx_context *ctx, const struct pipe_draw_info *info,
    ctx->layout.nvaryings = vs->nvaryings;
    ctx->layout.f32 = (1u << vs->nvaryings) - 1;
    ctx->layout.colour = 0;
+   ctx->layout.ncolours = ctx->draw_fs ? ctx->draw_fs->prog.ncolours : 0;
    ctx->gpu_vs = vs;
    submit(ctx);
    ctx->gpu_vs = NULL;

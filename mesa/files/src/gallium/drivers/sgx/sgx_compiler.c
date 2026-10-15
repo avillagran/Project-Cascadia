@@ -105,6 +105,13 @@ struct comp {
    unsigned fetch_slot[SGX_FRAME_MAX_FETCH];
    unsigned nfetch;
    bool fetch_only[VARYING_SLOT_MAX];
+   /* (M37) the flat-shaded varyings (st's nir_lower_flatshade: GL's
+    * glShadeModel(GL_FLAT) colours): the TA's colours, two at most, each
+    * iterated into one register after the inputs, its bytes as o0's --
+    * colour_of_slot[] their index, -1 not one */
+   bool flat[VARYING_SLOT_MAX];
+   int colour_of_slot[VARYING_SLOT_MAX];
+   unsigned colour_slot[2], ncolours;
    /* a rectangle texture's 1 / width, 1 / height, two words a texture
     * after their state words (nir_lower_tex's lower_rect: GL's rectangle
     * textures are 2D ones to the sampler) -- -1 none */
@@ -538,8 +545,10 @@ texture(struct comp *c, nir_tex_instr *tex, struct scratch *s)
       /* the PDS's lookup (M35): the texel in the primary attribute after
        * the inputs, as it is -- two VPCKs to F32 0..1 */
       d = block(c, 4, 4);
-      emit(c, usse_unpack_unorm8(treg(c, d), usse_reg(USSE_PA, 4 * c->ninputs + k), 0));
-      emit(c, usse_unpack_unorm8(treg(c, d + 2), usse_reg(USSE_PA, 4 * c->ninputs + k), 2));
+      emit(c, usse_unpack_unorm8(treg(c, d),
+                                 usse_reg(USSE_PA, 4 * c->ninputs + c->ncolours + k), 0));
+      emit(c, usse_unpack_unorm8(treg(c, d + 2),
+                                 usse_reg(USSE_PA, 4 * c->ninputs + c->ncolours + k), 2));
       goto out;
    }
    /* (a rectangle texture's coordinates are scaled by now: load_texture_scale,
@@ -703,7 +712,7 @@ plan_inputs(struct comp *c, nir_function_impl *impl)
             int slot;
 
             if (instr->type != nir_instr_type_tex || c->nfetch == SGX_FRAME_MAX_FETCH ||
-                (slot = fetch_slot(nir_instr_as_tex(instr))) < 0)
+                (slot = fetch_slot(nir_instr_as_tex(instr))) < 0 || c->flat[slot])
                continue;
             c->fetch_slot[c->nfetch] = slot;
             c->fetch[c->nfetch++] = nir_instr_as_tex(instr);
@@ -733,8 +742,17 @@ plan_inputs(struct comp *c, nir_function_impl *impl)
          if (instr->type != nir_instr_type_intrinsic ||
              (slot = input_slot(nir_instr_as_intrinsic(instr))) < 0 ||
              c->fetch_only[slot] || c->input_of_slot[slot] >= 0 ||
-             c->ninputs == SGX_FRAME_MAX_VARYINGS)
+             c->colour_of_slot[slot] >= 0 || c->ninputs == SGX_FRAME_MAX_VARYINGS)
             continue;
+         if (c->flat[slot]) {
+            if (c->ncolours == 2) {
+               fail(c, "more than two flat varyings");
+               return;
+            }
+            c->colour_slot[c->ncolours] = slot;
+            c->colour_of_slot[slot] = c->ncolours++;
+            continue;
+         }
          c->fs->input_slot[c->ninputs] = slot;
          c->input_of_slot[slot] = c->ninputs++;
       }
@@ -984,6 +1002,26 @@ intrinsic(struct comp *c, nir_intrinsic_instr *in)
          /* read by the PDS's lookups only (M35): not in the registers */
          for (unsigned i = 0; i < in->def.num_components; i++)
             c->loc[id + i] = usse_reg(USSE_PA, 0);
+         return;
+      }
+      if (c->colour_of_slot[slot] >= 0) {
+         /* one of the TA's colours (M37): its bytes, unpacked as o0's are
+          * for blending */
+         struct usse_reg raw = usse_reg(USSE_PA, 4 * c->ninputs + c->colour_of_slot[slot]);
+         unsigned d = block(c, 4, 4);
+
+         emit(c, usse_unpack_unorm8(treg(c, d), raw, 0));
+         emit(c, usse_unpack_unorm8(treg(c, d + 2), raw, 2));
+         for (unsigned i = 0; i < 4; i++) {
+            bool mine = i >= comp && i < comp + in->def.num_components;
+
+            if (mine) {
+               c->loc[id + i - comp] = treg(c, d + i);
+               c->owned[id + i - comp] = c->last_use[id + i - comp] >= 0;
+            }
+            if (!mine || c->last_use[id + i - comp] < 0)
+               give_back(c, d + i);
+         }
          return;
       }
       if (c->input_of_slot[slot] < 0) {
@@ -2172,7 +2210,7 @@ compile_fs(const nir_shader *fs, const struct sgx_blend_key *blend, char *why,
    if (!(c.fs = CALLOC_STRUCT(sgx_fs)))
       return NULL;
    for (unsigned i = 0; i < ARRAY_SIZE(c.input_of_slot); i++)
-      c.input_of_slot[i] = -1;
+      c.input_of_slot[i] = c.colour_of_slot[i] = -1;
 
    for (unsigned i = 0; i < ARRAY_SIZE(c.slot_of_unit); i++)
       c.slot_of_unit[i] = -1;
@@ -2198,6 +2236,14 @@ compile_fs(const nir_shader *fs, const struct sgx_blend_key *blend, char *why,
    }
 
    s = nir_shader_clone(NULL, fs);
+   /* the flat-shaded varyings: the TA's colours (M37) */
+   nir_foreach_shader_in_variable(var, s) {
+      if (var->data.interpolation != INTERP_MODE_FLAT || var->data.location < 0)
+         continue;
+      for (unsigned i = 0; i < glsl_count_attribute_slots(var->type, false); i++)
+         if (var->data.location + i < VARYING_SLOT_MAX)
+            c.flat[var->data.location + i] = true;
+   }
    if (blending)
       NIR_PASS(_, s, nir_lower_fragcolor, 1);
    NIR_PASS(_, s, nir_lower_io, nir_var_shader_in | nir_var_shader_out | nir_var_uniform,
@@ -2236,8 +2282,8 @@ compile_fs(const nir_shader *fs, const struct sgx_blend_key *blend, char *why,
    /* a pixel's registers, primary attributes and temporaries: 65 (an
     * unrolled loop's) hung the GPU; 64 is what the temporaries alone may
     * take */
-   if (align(4 * c.ninputs + c.nfetch, 4) + c.top > 64) {
-      fail(&c, "%u registers a pixel", align(4 * c.ninputs + c.nfetch, 4) + c.top);
+   if (align(4 * c.ninputs + c.ncolours + c.nfetch, 4) + c.top > 64) {
+      fail(&c, "%u registers a pixel", align(4 * c.ninputs + c.ncolours + c.nfetch, 4) + c.top);
       goto out;
    }
 
@@ -2291,7 +2337,14 @@ compile_fs(const nir_shader *fs, const struct sgx_blend_key *blend, char *why,
       mesa_logi("sgx: SGX_LDR_PROBE: %u words, samplers' state at sa%u", n, c.sampler_sa);
    }
    c.fs->prog.branches = c.branches && c.divergent;
-   c.fs->prog.ninputs = c.ninputs;
+   c.fs->prog.ninputs = c.ninputs + c.ncolours;
+   c.fs->prog.ncolours = c.ncolours;
+   c.fs->prog.nvaryings = c.ncolours;
+   for (unsigned j = 0; j < c.ncolours; j++) {
+      c.fs->input_slot[c.ninputs + j] = c.colour_slot[j];
+      c.fs->varying_slot[j] = c.colour_slot[j];
+      c.fs->prog.iter_src[c.ninputs + j] = j;
+   }
    for (unsigned i = 0; i < c.ninputs; i++) {
       if (c.fs->input_slot[i] == VARYING_SLOT_POS) {
          c.fs->prog.iter_src[i] = SGX_ITERATE_POSITION;

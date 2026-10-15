@@ -80,10 +80,15 @@ int sgx_frame_clear(struct sgx_frame *f, struct sgx_resource *rt, const float rg
 /* texture lookups the PDS makes for a pixel program (M35) */
 #define SGX_FRAME_MAX_FETCH 4
 
+/* (M37) the first ncolours varyings (two at most) are the TA's colours:
+ * flat-shaded ones (iOS's es1 e01: the base colour, TSP varying 10, and
+ * the offset colour, 11 -- the only ones the TSP shades flat), each after
+ * the position in the vertex as the others are */
 struct sgx_frame_layout {
    unsigned nvaryings;
    unsigned f32;
    unsigned colour;
+   unsigned ncolours;
 };
 
 static inline unsigned
@@ -111,6 +116,10 @@ struct sgx_pixel_program {
     * SGX_ITERATE_POSITION (gl_FragCoord); nvaryings of the layout's */
    uint8_t iter_src[SGX_FRAME_MAX_VARYINGS];
    unsigned nvaryings;
+   /* (M37) the layout's first ncolours varyings are the TA's colours: an
+    * input iterating one of them (iter_src < ncolours) takes one register,
+    * its bytes as o0's, after the inputs of four (the inputs' last) */
+   unsigned ncolours;
    unsigned nsa;
    /* uniform words in memory after the nsa (M32): the draw's words go on
     * with them, and sa word ubuf_sa has their address less 4 */
@@ -154,7 +163,13 @@ struct sgx_frame_state {
    bool stencil_on;
    uint32_t stencil;
    uint8_t stencil_ref;
+   /* (M37) flat shading of the layout's colours: state word 18 bits 18:17
+    * as iOS's (es1 e01: 3) -- the TSP takes a triangle's last vertex's
+    * colours with any value (gldesk: the first vertex's by turning the
+    * triangle round, sgx_draw.c) -- 0 when none */
+   uint8_t flat;
 };
+#define SGX_FLAT_LAST  3
 /* the TA's culling (state word 18, bits 1:0): the triangles clockwise or
  * anticlockwise in the target, row 0 at the top (M18) */
 #define SGX_CULL_NONE 0
@@ -206,7 +221,7 @@ sgx_frame_state_equal(const struct sgx_frame_state *x, const struct sgx_frame_st
    return x->depth_func == y->depth_func && x->depth_write == y->depth_write &&
           x->viewport == y->viewport && x->cull == y->cull &&
           x->stencil_on == y->stencil_on && x->stencil == y->stencil &&
-          x->stencil_ref == y->stencil_ref &&
+          x->stencil_ref == y->stencil_ref && x->flat == y->flat &&
           (!x->viewport || (x->scale[0] == y->scale[0] && x->scale[1] == y->scale[1] &&
                             x->scale[2] == y->scale[2] && x->translate[0] == y->translate[0] &&
                             x->translate[1] == y->translate[1] &&

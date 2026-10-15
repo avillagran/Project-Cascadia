@@ -2,7 +2,7 @@
  * (docs/research/p105-mesa.md, M35, M36): a 1D texture, sRGB textures (RGBA
  * and luminance, decoded or not), a rectangle texture (unnormalized
  * coordinates), the fixed-function pipeline (glBegin and client arrays, a
- * texture modulated by the vertex colour), logic ops (M37).  A 64 x 64 target, every pixel
+ * texture modulated by the vertex colour), flat shading and logic ops (M37).  A 64 x 64 target, every pixel
  * read back against what C works out.
  *
  *   sgx-gl gldesk [CASE]        (CASE: a name's start; all by default)
@@ -201,6 +201,47 @@ want_ff(float s, float t, float c[4])
 	c[3] = b[3] / 255.0f;
 }
 
+/* flat shading (M37): two triangles, a gap between them along the
+ * diagonal, each of the colour of one of its vertices -- flat_first: the
+ * first's (ARB_provoking_vertex), else the last's; flat_tex: times the
+ * sRGB texture's bytes as RGBA8 */
+static int flat_first, flat_tex;
+
+static void
+want_flat(float s, float t, float c[4])
+{
+	static const float last[2][4] = { { 0, 0, 1, 1 }, { 1, 1, 0, 1 } };
+	static const float first[2][4] = { { 1, 0, 0, 1 }, { 0, 1, 1, 1 } };
+	int k = s + t < 0.95f ? 0 : s + t > 1.05f ? 1 : -1;
+	uint8_t b[4];
+
+	srgb_bytes((int)(s * 4) + 4 * (int)(t * 4), b);
+	for (int i = 0; i < 4; i++) {
+		c[i] = k < 0 ? 0 : flat_first ? first[k][i] : last[k][i];
+		if (k >= 0 && flat_tex)
+			c[i] *= b[i] / 255.0f;
+	}
+}
+
+static void
+flat_case(const char *name)
+{
+	if (only && strncmp(name, only, strlen(only)))
+		return;
+	glShadeModel(GL_FLAT);
+	glClear(GL_COLOR_BUFFER_BIT);
+	glBegin(GL_TRIANGLES);
+	glColor4f(1, 0, 0, 1); glTexCoord2f(0, 0); glVertex2f(-1, -1);
+	glColor4f(0, 1, 0, 1); glTexCoord2f(0.95f, 0); glVertex2f(0.9f, -1);
+	glColor4f(0, 0, 1, 1); glTexCoord2f(0, 0.95f); glVertex2f(-1, 0.9f);
+	glColor4f(0, 1, 1, 1); glTexCoord2f(1, 1); glVertex2f(1, 1);
+	glColor4f(1, 0, 1, 1); glTexCoord2f(0.05f, 1); glVertex2f(-0.9f, 1);
+	glColor4f(1, 1, 0, 1); glTexCoord2f(1, 0.05f); glVertex2f(1, -0.9f);
+	glEnd();
+	glShadeModel(GL_SMOOTH);
+	want_ok(want_flat, 2, name);
+}
+
 /* the logic ops (M37): the target cleared to bytes 51 102 153 204, then
  * the program's colour -- bytes 32 i across, 32 j up, 128, 64 -- xor'ed
  * over it, through a colour mask, and with the left half discarded */
@@ -373,6 +414,26 @@ main(int argc, char **argv)
 		glDisable(GL_TEXTURE_2D);
 	}
 
+	glClearColor(0, 0, 0, 0);
+	flat_case("flat shading, the last vertex");
+	if (strstr((const char *)glGetString(GL_EXTENSIONS), "GL_ARB_provoking_vertex")) {
+		void (*provoking)(GLenum) = (void (*)(GLenum))eglGetProcAddress("glProvokingVertex");
+
+		flat_first = 1;
+		provoking(0x8E4D);     /* GL_FIRST_VERTEX_CONVENTION */
+		flat_case("flat shading, the first vertex");
+		provoking(0x8E4E);     /* GL_LAST_VERTEX_CONVENTION */
+		flat_first = 0;
+	}
+	if (!only || !strncmp("flat shading, textured", only, strlen(only))) {
+		glActiveTexture(GL_TEXTURE0);
+		glEnable(GL_TEXTURE_2D);
+		glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
+		flat_tex = 1;
+		flat_case("flat shading, textured");
+		flat_tex = 0;
+		glDisable(GL_TEXTURE_2D);
+	}
 	logic_check("a logic op, xor", 0xf, 0);
 	logic_check("a logic op, red and blue masked in", 0x5, 0);
 	logic_check("a logic op, half discarded", 0xf, 1);

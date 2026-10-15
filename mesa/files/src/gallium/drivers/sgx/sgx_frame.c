@@ -213,6 +213,46 @@ iter_xor(void)
    return x;
 }
 
+/* Input i's iterate (M37): a varying's four F32 into four registers, or
+ * one of the TA's colours (iter_src < ncolours: TSP varying 10, 11) into
+ * one, its bytes as o0's (iOS's es1 e00: control 0x0fc0a00f, DOUT size
+ * 0x02), shaded flat -- bit 26 clear (e01's 0x0bc0a00f).  The others'
+ * TSP varyings are the layout's less the colours. */
+static uint32_t
+iterate_control(const struct sgx_pixel_program *p, unsigned i)
+{
+   unsigned v = p->iter_src[i];
+   uint32_t w = i == p->ninputs - 1 ? ITERATE_F32_VEC4 : ITERATE_F32_VEC4_MORE;
+
+   if (v == SGX_ITERATE_POSITION)
+      w |= v << 12;
+   else if (v < p->ncolours)
+      w = (w & ~(1u << 26)) | (10 + v) << 12;
+   else
+      w |= (v - p->ncolours) << 12;
+   return w ^ iter_xor();
+}
+
+static void layout_words(uint32_t *full, const struct sgx_frame_layout *l);
+
+static bool
+iterates_colour(const struct sgx_pixel_program *p, unsigned i)
+{
+   return p->iter_src[i] != SGX_ITERATE_POSITION && p->iter_src[i] < p->ncolours;
+}
+
+/* the primary attributes the PDS fills: four an input, one a colour, one a
+ * texel */
+static unsigned
+pixel_pa(const struct sgx_pixel_program *p)
+{
+   unsigned n = p->nfetch;
+
+   for (unsigned i = 0; i < p->ninputs; i++)
+      n += iterates_colour(p, i) ? 1 : 4;
+   return n;
+}
+
 static uint32_t
 pds_texture(unsigned s)
 {
@@ -507,8 +547,7 @@ sa_field(unsigned nsa)
 static uint32_t
 pixel_word5(const struct sgx_pixel_program *pix)
 {
-   unsigned fours = DIV_ROUND_UP(4 * pix->ninputs + pix->nfetch, 4) +
-                    DIV_ROUND_UP(pix->ntemps, 4);
+   unsigned fours = DIV_ROUND_UP(pixel_pa(pix), 4) + DIV_ROUND_UP(pix->ntemps, 4);
 
    return fours << 27 | (fours > 1 ? MAX2(12 / fours, 1) : 0) << 23 | sa_field(pix->nsa);
 }
@@ -1704,14 +1743,13 @@ upload(struct sgx_frame *f, struct sgx_pixel_program *p)
    pds[n++] = (p->ninputs ? ITER_TEMPS : 2) | p->branches;
    pds[n++] = 0;
    for (unsigned i = 0; i < p->ninputs; i++)
-      pds[n++] = ((i == p->ninputs - 1 ? ITERATE_F32_VEC4 : ITERATE_F32_VEC4_MORE) |
-                  p->iter_src[i] << 12) ^ iter_xor();
+      pds[n++] = iterate_control(p, i);
    while (n % 4)
       pds[n++] = 0;
    data = n;
    pds[n++] = PDS_DOUTU_ROW0_ITER;
    for (unsigned i = 0; i < p->ninputs; i++)
-      pds[n++] = pds_iterate(3 + i, 0x32);
+      pds[n++] = pds_iterate(3 + i, iterates_colour(p, i) ? 0x02 : 0x32);
    pds[n++] = PDS_END;
    p->pds_va = pds_va;
    p->pds_rows = data / 4;
@@ -1997,15 +2035,8 @@ render(struct sgx_frame *f, struct sgx_resource *rt, const struct sgx_frame_layo
          full[4] = rows << 27 | (uni_pds >> 4 & 0x07ffffff);
       }
    }
-   if (l) {
-      /* the vertex's size in words (31:24); three bits a varying, 111 for
-       * four components; a bit a varying kept as F16 */
-      full[16] = (4 + 4 * l->nvaryings) << 24 | (full[16] & 0x00ffffff);
-      full[19] = 0;
-      for (i = 0; i < l->nvaryings; i++)
-         full[19] |= 7u << 3 * i;
-      full[20] = ~l->f32 & ((1u << l->nvaryings) - 1);
-   }
+   if (l)
+      layout_words(full, l);
    d0 = frame;
    memcpy(prog, f->tmpl + f->toff[T_FULLPROG], f->tsize[T_FULLPROG]);
    prog[0] = d0;
@@ -2101,6 +2132,23 @@ sgx_frame_max_draws(const struct sgx_frame *f)
    return f->max_draws;
 }
 
+/* The layout's words of a draw's state: the vertex's size in words
+ * (16, bits 31:24), the TA's colours (16: bit 11 the base, 10 the offset
+ * colour -- iOS's es1 e00, e20), three bits each of the other varyings, 111
+ * for four components (19), a bit each of those kept as F16 (20) */
+static void
+layout_words(uint32_t *full, const struct sgx_frame_layout *l)
+{
+   unsigned ng = l->nvaryings - l->ncolours;
+
+   full[16] = (4 + 4 * l->nvaryings) << 24 | (full[16] & 0x00fff3ff) |
+              (l->ncolours > 0 ? 1u << 11 : 0) | (l->ncolours > 1 ? 1u << 10 : 0);
+   full[19] = 0;
+   for (unsigned i = 0; i < ng; i++)
+      full[19] |= 7u << 3 * i;
+   full[20] = (~l->f32 >> l->ncolours) & ((1u << ng) - 1);
+}
+
 /* SGX_STATE=word:mask[,word:mask...] flips bits of every draw's state
  * words, to find what they do */
 static void
@@ -2168,11 +2216,11 @@ fetch_pds(struct sgx_frame *f, const struct sgx_pixel_program *p, const uint32_t
    pds[n++] = (p->ninputs ? ITER_TEMPS : 2) | PDS_FLAGS_FETCH | p->branches;
    pds[n++] = 0;
    for (unsigned i = 0; i < p->ninputs; i++)
-      pds[n++] = ((i == p->ninputs - 1 ? ITERATE_F32_VEC4 : ITERATE_F32_VEC4_MORE) |
-                  p->iter_src[i] << 12) ^ iter_xor();
+      pds[n++] = iterate_control(p, i);
    for (unsigned k = 0; k < p->nfetch; k++) {
       ctrl[k] = n;
-      pds[n++] = FETCH_CONTROL_2D | (k == p->nfetch - 1 ? FETCH_LAST : 0) | p->fetch_src[k];
+      pds[n++] = FETCH_CONTROL_2D | (k == p->nfetch - 1 ? FETCH_LAST : 0) |
+                 (p->fetch_src[k] - p->ncolours);
       if (n & 1)
          pds[n++] = 0;
       state[k] = n;
@@ -2184,7 +2232,7 @@ fetch_pds(struct sgx_frame *f, const struct sgx_pixel_program *p, const uint32_t
    data = n;
    pds[n++] = PDS_DOUTU_ROW0_ITER;
    for (unsigned i = 0; i < p->ninputs; i++)
-      pds[n++] = pds_iterate(3 + i, 0x32);
+      pds[n++] = pds_iterate(3 + i, iterates_colour(p, i) ? 0x02 : 0x32);
    for (unsigned k = 0; k < p->nfetch; k++) {
       pds[n++] = pds_iterate(ctrl[k], FETCH_SIZE_RAW);
       pds[n++] = pds_texture(state[k]);
@@ -2251,11 +2299,9 @@ draw_state(struct sgx_frame *f, const struct sgx_frame_draw *d, const struct sgx
          return -EINVAL;
       full[6] = 1u << 27 | (iter_pds_at(f, l->colour, f32) >> 4 & 0x07ffffff);
    }
-   full[16] = (4 + 4 * l->nvaryings) << 24 | (full[16] & 0x00ffffff);
-   full[19] = 0;
-   for (unsigned i = 0; i < l->nvaryings; i++)
-      full[19] |= 7u << 3 * i;
-   full[20] = ~l->f32 & ((1u << l->nvaryings) - 1);
+   layout_words(full, l);
+   /* flat shading (M37): the provoking vertex (iOS's es1 e01: 3) */
+   full[18] = (full[18] & ~(3u << 17)) | (uint32_t)d->st.flat << 17;
    state_xor(full);
    if (f->debug_state) {
       fprintf(stderr, "sgx: state");
@@ -2273,7 +2319,7 @@ static bool
 same_state(const struct sgx_frame_draw *a, const struct sgx_frame_draw *b)
 {
    if (!a->prog != !b->prog || a->vs != b->vs || a->l.nvaryings != b->l.nvaryings ||
-       a->l.f32 != b->l.f32 || a->l.colour != b->l.colour)
+       a->l.f32 != b->l.f32 || a->l.colour != b->l.colour || a->l.ncolours != b->l.ncolours)
       return false;
    if (a->prog && (a->prog->code_va != b->prog->code_va || a->prog->pds_va != b->prog->pds_va ||
                    a->prog->nsa != b->prog->nsa ||
