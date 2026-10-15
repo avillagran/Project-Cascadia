@@ -2606,6 +2606,206 @@ a clip plane, point sprites and point sizes, linear fog, smooth lines,
 polygon offset, two-sided lighting, texture env ADD, plain points and
 lines; shadercap runs it after the corpus, into `es1/`.
 
+## M37: what iOS's fixed function showed; uploads that wait for nothing
+
+**The capture** (2026-10-15, `tools/shadercap.sh`: the corpus's m00..m31
+and the OpenGL ES 1 cases e00..e24, each case's render commands logged)
+answered most of what M36 left, mostly as state words (`corpus.py --state`
+side by side, the first block of each case the draw's own):
+
+- The render commands of an opaque draw, a discarding one with and
+  without depth, and a blended one (m00..m03) are the same but for
+  addresses, and rtemu.py's 3D block for iOS's payload is ours but for
+  them and the ZLS: **punch-through is not in the render's registers** --
+  still not found (ISP state A bit 27 and iOS's two-phase program, M19).
+- ISP state A (word 1): bits 16:15 the object -- 01 lines (e18, e23, e24),
+  11 points (e16, e22), 10 point sprites (e15); bit 14 counts the samples a
+  draw passes (m29, below), bit 18 only whether any did; bit 9 (set in
+  every state) turns word 2's depth bias on.
+- Word 2: the depth bias, bits 25:21 the slope's factor and 20:16 the
+  units (below).
+- Word 16 besides the vertex's size: bit 11 the TA's base colour, 10 its
+  offset colour (e20, two-sided lighting's two), 9 fog (e17: a word,
+  TSP varying 12), 8 a point size (e16, e22), bits 3:0 the user clip planes
+  (e14: 09001801, a word more in the vertex).
+- Word 18 bits 18:17 are 3 for flat shading (e01, e02, e24) -- and bit 26
+  of the colour's iterate control word clear (0fc0a00f -> 0bc0a00f): below.
+- Texture state words: the formats and swizzles of PS Vita's SceGxmTexture
+  (m10..m20; word 1 bits 28:24, word 3 bits 30:28) -- U8 0x00, U4U4U4U4
+  0x02, U1U5U5U5 0x04, U5U6U5 0x05, U8U8 0x07, U8U8U8U8 0x0c, F16x4 0x1b;
+  565 swizzled 1RGB, 4444 and 5551 ARGB, L8 1RRR, A8 R000, LA8 GRRR, RGB8 as
+  RGBX 1BGR; word 3 bit 31 hands the texel back as F16 (half floats, sRGB,
+  which is word 0 bit 27, GXM's gamma mode). Depth textures are the depth
+  buffer's own tiles, type 4 (tiled), F32M 0x13 (m04..m06).
+- The pixel back end's formats (m25..m28): r0 of the end-of-tile program,
+  0x34110000 565, 0x54110000 4444, 0x44110000 5551, 0x07010000 half floats
+  (8888 is our 0x00110000); r2 the width in pixels / 2 - 1.
+- Logic ops (e03..e10), the alpha test (e11..e13: punch-through and a
+  discard), two-sided lighting (e20: `gl_FrontFacing`'s bit), shadow
+  samplers (m07, m08: the reference clamped, the depth raw, `tex - ref >=
+  0`) are the program's. iOS 8.4.1 on the A5 has no EXT_frag_depth (m09 did
+  not compile).
+
+**Logic ops** as iOS's: the colour packed to bytes, then one VBW with the
+tile's -- `xor o0, pa0, o0`, NOT as `and o0, c56, ~x` (c56 is all ones).
+The encoder has VBW between registers now (`usse_vbw`, iOS's eight words bit
+for bit in usse-test); the variant key the op; `output()` the op, then a
+colour mask on the bytes (o0 is B G R A) and a discard (the result and the
+tile's unpacked, chosen, packed again). nir_lower_blend's logic ops are
+integer operations, which the compiler has not. piglit's gl-1.0-logicop,
+gl-1.1-xor and its copypixels case pass.
+
+**Why XFCE dragged** -- a window moved at two or three steps a second on
+glamor, when fbdev's CPU drawing kept up. The X server at 85-100 % CPU, and
+its ioctls over one drag (120 steps): 3382 renders, 1644 buffers made and
+freed, 7032 syncobj waits. perf: 80 % of the X server's time in the texture
+copy (`sgx_resource_texture` 60 %, A8 to RGBA8 15 %, divisions in the
+twiddle 6 %). glamor draws glyphs and masks from A8 textures and uploads
+into them between draws; each such upload flushed the render (the draws
+read the texture), waited for it, and the copy the sampler reads was made
+again whole, RGBA8, after `sgx_frame_finish` waited for the GPU to go idle.
+And at every step of a drag glamor makes new A8 textures of the window's
+size and fills them once (`SGX_DEBUG=copies`). Now:
+
+- A copy a render may still read -- gathered or running -- is not written
+  over: a new buffer from the cache takes the new one, the old one stays
+  with the render (the batch references each copy it samples, `tex_bo[]`,
+  busy with the render once made). A map of a texture whose linear content
+  no render reads or writes (sampled through its copy) neither flushes nor
+  waits.
+- A texture of one level written in boxes keeps a shadow of its copy in
+  cached memory (`tw_cpu`): only the box is made again, and the range of
+  the copy it falls in (Morton order is monotonic in x and in y) copied
+  over; a small box of a big copy waits for its renders rather than copying
+  all of it again. Morton order by tables, no divisions.
+- The formats the sampler has are copied as they are, 1, 2 or 4 bytes a
+  texel, by the words above (`native_format()`): RGBA8, BGRA8 (its
+  swizzle, no swap in the program any more), RGBX, BGRX, 565, 4444, 5551,
+  L8, A8, LA8. The sampler hands each texel back as an RGBA8 texel's four
+  bytes (iOS's program for 565 is `or o0, pa0`), so programs are as they
+  were. A cube map of one-byte texels is the exception (its faces are not
+  where the 2 KiB rule puts them: dEQP's size.cube.16x16_l8), made RGBA8.
+- A texture of one level in such a format is sampled linear -- no copy at
+  all -- when its sampler takes the nearest texel both ways: nothing is
+  lost then (the linear way loses the minification filter; minified alone,
+  dEQP's nearest_linear_clamp_*_npot went wrong). The linear way takes the
+  same formats and swizzles (GXM's linear strided type 6): the B G R A it
+  "read by itself" (M16) was swizzle 1.
+
+`tools/sgx/gl/glupload.c`: a texture written box by box, each version drawn
+before the next box in one render (RGBA 128 x 64 and 64 x 128, two Morton
+squares; ALPHA; 100 x 60, padded), each format the sampler reads as it is;
+13 of 13 either way (`SGX_TEX_NATIVE=0`, `SGX_LINEAR_TEX=1`). A 1024 x 1024
+upload and draw 230 -> 24 ms; 64 boxes of 16 x 16, a draw after each,
+13.3 s -> 62 ms. The X server over the first drag of a new window: 15 s of
+CPU -> 3.7 s (the xdotool steps' own pace now), a second drag 2.3 s, two
+copies made in all. `SGX_DEBUG=fps,flushes` reports per flush, for a
+process that never swaps (the X server: ~85 renders a second, one or two
+draws each, flushed at glFlush and at each framebuffer change).
+
+Found on the way: piglit's map_invalidate cases passed or failed with
+where the heap was -- a buffer's CPU memory is 64-byte aligned now (GL's
+MIN_MAP_BUFFER_ALIGNMENT; musl's malloc gives 16).
+
+**Flat shading.** OpenGL ES 1's colour is not a varying but the TA's base
+colour (word 16 bit 11), after the position in the vertex as a varying
+would be, TSP varying 10, iterated into one register -- its bytes as o0's,
+or as F16 into two (e20) -- and flat when bit 26 of its iterate's control
+word is clear. Bits 18:17 of word 18 are 3 then, as iOS has them; the TSP
+takes the last vertex's colour whatever they say (gldesk), and no other
+varying is shaded flat by anything found (M36's bits, e01's on varying 0).
+So a flat input -- st's nir_lower_flatshade makes GL's flat colours so --
+is one of the TA's two colours (10 and 11): the layout's first varyings,
+iterated after the others into a register each, unpacked as o0 is for
+blending (`colour_of_slot[]`; the layout's `ncolours`, word 16's bits, the
+others' TSP numbers less the colours'). ARB_provoking_vertex's first vertex
+by turning each triangle round (b, c, a) to end with it. gldesk: last and
+first vertex, textured; piglit: glsl-fs-flat-color, gl-1.0-dlist-shademodel,
+provoking-vertex, arb-provoking-vertex-clipped-geometry-flatshading.
+
+**Polygon offset, found, left off.** e19 and m30 (glPolygonOffset(1, 2):
+word 2 0x0000f000 -> 0x0022f000) and `gloffset --probe` flipping bits: bits
+25:21 the factor and 20:16 the units, each a signed 5-bit integer; a unit is
+32 of 24-bit depth's at depths 0.5..1, a power of two less below (floating
+point, by the depth of the triangle's last vertex), the factor exact on
+`gloffset`'s slopes. With `SGX_ISP_OFFSET=1` the GPU's vertex path takes it
+for whole factors and units -16..15 (the draw module's unit made the same,
+both paths 12 of 12). Not by default: the ISP does not clamp the depth it
+offsets to 0..1 (`gloffset --clamp`; every bit of words 1, 2 and 18 near
+flipped), and dEQP's result_depth_clamp and factor_1_slope cases want it --
+the draw module's offset it stays, dEQP's polygon_offset 14 of 14.
+
+**Occlusion queries.** There were none: no `create_query`, Mesa said 0
+counter bits and every query 0 samples (everything hidden, to a program
+that culls by them). m29: ISP state A bit 14 counts the samples a draw
+passes into the visibility buffer that the 3D block's first two words name
+-- the kext's from GL's payload words 42 and 43, 0x640 apart: a count for
+each core. No bit picks one of several counts (bits 15..23 of word 1 are
+the object's type and the depth test), so a render goes at each begin and
+end, every render a query is active in has a buffer of its own (from the
+cache, zeroed), and the result is theirs added; it is ready when the last
+render before the query's end is (piglit's occlusion_query_order). gldesk:
+a quad's 1536 samples exactly, none behind another. Known: a discarded
+pixel is counted (discard keeps the tile's colour, M19 -- piglit's
+occlusion-query-discard, and glBitmap's meta_fragments), and with depth
+writes off the ISP counts some samples the depth test fails, though it
+draws them right (conform's multi2).
+
+**Depth textures and shadow samplers.** A depth texture's copy is F32 now
+(format 0x12, nearest -- the sampler filters no F32, iOS has no
+OES_texture_float_linear), not 8-bit grey; a depth buffer the GPU wrote is
+read out of the ISP's tiles first (`zs_to_linear`), and its copy is made
+again after every render that stores it: shadow maps work. The variant key
+has the depth units, their views' swizzles (GL's depth texture modes) and
+the compared ones' functions; nir_lower_tex_shadow compares in the program
+as iOS does (ALWAYS until a variant says), and a depth texel is d, 0, 0, 1
+through the swizzle. The key is built from the shader's textures_used, not
+its compiled form's samplers: a lookup compared ALWAYS is a constant there.
+gldesk: read, LEQUAL and GREATER against 0.5, a shadow map the GPU drew;
+piglit: depth-tex-compare, depth-tex-modes, depth-tex-modes-glsl, texdepth,
+fbo-depthtex.
+
+**Two-sided colour.** GL's back colours never reached the program: st's
+nir_lower_two_sided_color picks gl_FrontFacing's between COL0/1 and
+BFC0/1, and the compiler took no input past the texture coordinates but
+the generic ones. It takes the back colours as it does the colours now:
+piglit's two-sided-lighting cases and vertex-program-two-side's pass.
+
+dEQP-GLES2 groups re-run: texture 769 / 62 and polygon_offset 14 / 14 as
+r37/r38, fbo 544 / 0.
+
+**piglit p5** (the release build, `/root/piglit-results/p5`, before the
+two-sided colour): **807 pass, 161 fail**, 1 crash, 1 timeout -- p4's 774 /
+187. 38 fixed (the logic ops, flat shading and provoking vertex, depth
+textures and shadow compare, rectangle textures, drawpixels and readpixels
+of depth and stencil, map alignment, ...), 7 query tests run that were
+skipped (5 pass). It broke 10, fixed since: a flat varying that is not a
+colour (the linker's, glsl-sin and glsl-cos) and linear sampling that
+repeats (texwrap 2d, texwrap formats). With those and two-sided colour's 9,
+the next whole run should read about 826. What fails is mostly border
+colours (14), 3D textures (10), depth and stencil copies and draws of
+pixels, punch-through's (discard with depth, its queries), pbo, line
+stipple and smooth lines.
+
+**What the rest needs:**
+
+- Punch-through (a discard that writes no depth; the alpha test with
+  depth; queries of discarding draws): not in the render's registers nor
+  in anything per draw that differs from ours -- still M19's question.
+- From the capture, ready to do: user clip planes in the TA (word 16 bits
+  3:0, a word in the vertex after the varyings, written by a VDP with its
+  clip flag -- e14's `dp4.f32 o8.x, pa4.x000, i1.xyzw clip0`; an encoder
+  for it first: no draw module for them then), points and point
+  sprites as the ISP's objects (word 1 bits 16:15, word 16 bit 8, e15's
+  sprite coordinates are lookup kind 5), fog (bit 9, varying 12), the
+  pixel back end's 565/4444/5551/half formats (the end-of-tile words above),
+  depth textures sampled straight from the ISP's tiles (type 4, F32M: no
+  copy for shadow maps).
+- Border colours: GXM's border modes (4..7) clamp to texels of the texture's
+  own, there is no border colour -- the program's, if anything.
+- Polygon offset's clamp; gl_PointCoord (VARYING_SLOT_PNTC); 3D textures;
+  F16 arithmetic.
+
 ## Testing, without and with the device
 
 - **Host, every change:** the kernel driver builds with `W=1` against the

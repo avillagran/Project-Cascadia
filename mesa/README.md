@@ -106,7 +106,18 @@ sgx-gl glflow                    # texture lookups, dFdx/dFdy in programs that b
 sgx-gl glfetch                   # texture lookups the PDS makes before the program (M35);
                                  # SGX_NOFETCH=1: all in the program
 sgx-gl gldesk                    # desktop OpenGL 2.1: 1D, sRGB and rectangle textures, the
-                                 # fixed-function pipeline (M35, M36)
+                                 # fixed-function pipeline (M35, M36); depth textures, shadow
+                                 # samplers, flat shading, occlusion queries, logic ops (M37)
+sgx-gl glupload                  # textures written between draws that read them, each format
+                                 # the sampler reads as it is, upload times (M37)
+sgx-gl gloffset                  # glPolygonOffset's units and factors (M37); --probe with
+                                 # SGX_STATE=2:mask, --clamp: whether a depth past 1 is clamped
+SGX_ISP_OFFSET=1 sgx-gl gloffset # the ISP's polygon offset instead of the draw module's
+SGX_DEBUG=copies sgx-gl glupload # each texture copy the CPU makes: whole, a box, a new buffer
+SGX_DEBUG=fps,flushes desktop    # the per-2 s report for the X server (it never swaps): its
+                                 # renders, where they were flushed from (M37)
+SGX_TEX_NATIVE=0 sgx-gl glupload # every texture copied as RGBA8 (M36's way)
+SGX_LINEAR_TEX=1 sgx-gl glupload # every texture of one level sampled linear (0: never)
 SGX_STATE=16:0x200 sgx-gl glflat # which vertex's colour a triangle takes (finding flat
                                  # shading, M36)
 SGX_DEBUG_NIR=1 sgx-gl glfs mad  # the NIR the compiler takes (M36)

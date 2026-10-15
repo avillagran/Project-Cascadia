@@ -1287,12 +1287,22 @@ frames and touches in dmesg; `z2-boot -p N -N` reads the frames itself, without 
 - Tests on the iPad: `sgx-gl glfs`, `gltex`, `glflow`, `glfetch`, `gldesk`, ...
   (`tools/sgx/gl`, mesa/README.md lists them); dEQP-GLES2 in `/root/deqp`
   (`tools/sgx/deqp-run.py`, ~30 min: 16 859 pass / 91 fail); piglit in
-  `/root/piglit` (`tools/piglit`: build.sh, install.sh, run.sh NAME, ~40 min;
-  `python3 /root/pigsum.py /root/piglit-results/NAME`).
+  `/root/piglit` (`tools/piglit`: build.sh, install.sh, run.sh NAME, ~40-90
+  min; `python3 /root/pigsum.py /root/piglit-results/NAME`; p5 2026-10-15:
+  807 pass / 161 fail, ~826 with M37's last fixes). A release build beside
+  the system's for it: `mesa/devbuild.sh release`, then
+  `WRAP="env SGX_MESA=/root/sgx-mesa-rel /root/sgx-dev" /root/piglit/run.sh NAME`.
 - Packages for the iPad without its network: `tools/device-apk.sh PKG...`
   (armhf from docker, installed offline). On it now: binutils, gdb, waffle,
   py3-mako, xwd, xdotool, sdl3-dbg, musl-dbg.
 - X screenshots: `python3 tools/desktop/xshot.py out.png [:0]`.
+- M37 (p105-mesa.md): `glupload` (texture uploads between draws, each
+  format), `gloffset` (polygon offset; `--probe`, `--clamp`), gldesk's depth,
+  shadow, flat, occlusion and logic op cases. The X server's renders:
+  `SGX_DEBUG=fps,flushes desktop` (it never swaps: a report per flush);
+  texture copies: `SGX_DEBUG=copies`. A window drag in XFCE: drive it with
+  xdotool (`mousemove X Y mousedown 1`, steps, `mouseup 1`) and read the X
+  server's CPU in `/proc/$(pidof Xorg)/stat` or `perf record -p`.
 - iOS's GL driver as the oracle: `bash tools/shadercap.sh` with the iPad in iOS
   (corpus + OpenGL ES 1 cases, render commands logged), then
   `python3 tools/iosgpu/corpus.py logs/ios/corpus/DATE [--pds|--state|--own] [CASE]`.
@@ -1307,3 +1317,5 @@ frames and touches in dmesg; `z2-boot -p N -N` reads the frames itself, without 
 | `dmesg \| grep -c "not done after"` counts old hangs | the ring buffer rolls and the message comes ~2 s late: `hangs.sh` with a timestamp, `sleep 3` first |
 | a scratch script named `dis.py` breaks Python (`import dis`) | don't name helpers after stdlib modules; run tools with `python3 -I` |
 | SuperTux `--renderer opengl` exits ("Missing GL version", GL_MAJOR_VERSION) | SuperTux 0.6.3 asks GL 3's query in its GL 2 path: `--renderer sdl` (tools/sgx/supertux-mesa.sh) |
+| `perf probe -x libgallium ...` (uprobes) and the renders fail | the driver is Thumb code and the probes break it: remove them (`echo > /sys/kernel/tracing/uprobe_events`); count with `perf record -e raw_syscalls:sys_enter --filter 'id == 54'` (ioctls) instead |
+| `ssh cascadia 'pkill -f NAME ...'` and the ssh session dies | `-f` matches the ssh's own shell, whose command line has NAME: `pkill -x` |
