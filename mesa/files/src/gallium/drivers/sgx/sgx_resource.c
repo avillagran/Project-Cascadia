@@ -103,6 +103,7 @@ sgx_resource_destroy(struct pipe_screen *pscreen, struct pipe_resource *prsc)
 
    /* a render still using it holds the kernel's reference */
    sgx_bo_destroy(res->tw);
+   FREE(res->tw_cpu);
    sgx_bo_destroy(res->zls);
    sgx_bo_destroy(res->bo);
    if (res->data)
@@ -188,15 +189,41 @@ sgx_resource_from_handle(struct pipe_screen *pscreen, const struct pipe_resource
 
 /* Morton order, y in the even bits (the layout iOS's GL driver uploads); a
  * rectangle is a row (or column) of such squares, the side of the shorter
- * edge, one after another (docs/research/p105-gpu.md, M7) */
-static uint32_t
-twiddle(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
-{
-   uint32_t m = MIN2(w, h), i = 0, xs = x % m, ys = y % m;
+ * edge, one after another (docs/research/p105-gpu.md, M7).  By tables
+ * (M37): x's bits spread to the odd places, y's to the even ones, for the
+ * square's side -- not a loop and two divisions a texel. */
+struct twiddle {
+   uint32_t *mx, *my;           /* the side's entries each */
+   unsigned shift;              /* log2 of the side */
+   bool wide;                   /* the squares go along x */
+};
 
-   for (unsigned b = 0; (1u << b) < m; b++)
-      i |= ((ys >> b) & 1) << (2 * b) | ((xs >> b) & 1) << (2 * b + 1);
-   return (w >= h ? x / m : y / m) * m * m + i;
+static bool
+twiddle_init(struct twiddle *t, unsigned w, unsigned h)
+{
+   unsigned m = MIN2(w, h);
+
+   t->shift = util_logbase2(m);
+   t->wide = w >= h;
+   if (!(t->mx = MALLOC(2 * m * sizeof(uint32_t))))
+      return false;
+   t->my = t->mx + m;
+   for (unsigned v = 0; v < m; v++) {
+      t->mx[v] = t->my[v] = 0;
+      for (unsigned b = 0; (1u << b) < m; b++) {
+         t->mx[v] |= ((v >> b) & 1) << (2 * b + 1);
+         t->my[v] |= ((v >> b) & 1) << (2 * b);
+      }
+   }
+   return true;
+}
+
+static inline uint32_t
+twiddle_at(const struct twiddle *t, unsigned x, unsigned y)
+{
+   unsigned mask = (1u << t->shift) - 1;
+
+   return ((t->wide ? x : y) >> t->shift << 2 * t->shift) + t->mx[x & mask] + t->my[y & mask];
 }
 
 /* a row of the texture's content as 8-bit RGBA (depth: grey, alpha 1 --
@@ -231,75 +258,245 @@ unpack_row(enum pipe_format format, const uint8_t *line, unsigned w, uint32_t *r
  * it is (sgx_resource_texture), the padding is its memory's layout.  A cube
  * map's is scaled up to one, the nearest texel (GXM's arbitrary cube map,
  * type 7, read past the copy here and hung the renders): a direction cannot
- * be scaled to a part of a face. */
-static bool
-copy_texture(struct sgx_screen *screen, struct sgx_resource *res, unsigned first)
+ * be scaled to a part of a face.
+ *
+ * M37: made in cached memory and copied over in one go (Morton order's
+ * scattered stores into a write-combined map were most of the time); into
+ * a new buffer from the cache when a render may still read the old one --
+ * gathered or running -- the old one left to it (the batch references it),
+ * not waiting for the GPU to be idle.  A texture of one level written in
+ * boxes of it since (glamor's glyphs, a game's streamed sprites) keeps its
+ * copy's shadow, tw_cpu: only the box is made again there, and the range of
+ * the copy it falls in copied over. */
+/* M37: formats the sampler reads as they are in memory -- iOS's corpus
+ * m10..m19, the words of PS Vita's SceGxmTexture: the base format in word 1
+ * bits 28:24, the swizzle in word 3 bits 30:28 (named from the top bits
+ * down: ABGR is R in the low byte).  Their texels are twiddled as they are,
+ * 1, 2 or 4 bytes; the sampler hands each back as the four bytes an RGBA8
+ * texel's are, in the same order (iOS's program for 565 and 4444 is `or o0,
+ * pa0`).  0: not one of them -- made RGBA8 by util_format.  SGX_TEX_NATIVE=0:
+ * none. */
+static unsigned
+native_format(enum pipe_format f, uint32_t *fmt, uint32_t *swizzle)
 {
+   static int on = -1;
+
+   if (on < 0)
+      on = !getenv("SGX_TEX_NATIVE") || atoi(getenv("SGX_TEX_NATIVE"));
+   *fmt = 0x0c;
+   *swizzle = 0;
+   if (!on)
+      return 0;
+   switch (util_format_linear(f)) {
+   case PIPE_FORMAT_R8G8B8A8_UNORM: *fmt = 0x0c; *swizzle = 0; return 4;  /* ABGR */
+   case PIPE_FORMAT_B8G8R8A8_UNORM: *fmt = 0x0c; *swizzle = 1; return 4;  /* ARGB */
+   case PIPE_FORMAT_R8G8B8X8_UNORM: *fmt = 0x0c; *swizzle = 4; return 4;  /* 1BGR: iOS's RGB8 */
+   case PIPE_FORMAT_B8G8R8X8_UNORM: *fmt = 0x0c; *swizzle = 5; return 4;  /* 1RGB */
+   case PIPE_FORMAT_B5G6R5_UNORM:   *fmt = 0x05; *swizzle = 5; return 2;  /* 1RGB: iOS's 565 */
+   case PIPE_FORMAT_B4G4R4A4_UNORM: *fmt = 0x02; *swizzle = 1; return 2;  /* ARGB */
+   case PIPE_FORMAT_B5G5R5A1_UNORM: *fmt = 0x04; *swizzle = 1; return 2;  /* ARGB */
+   case PIPE_FORMAT_L8_UNORM:       *fmt = 0x00; *swizzle = 5; return 1;  /* 1RRR: iOS's L8 */
+   case PIPE_FORMAT_A8_UNORM:       *fmt = 0x00; *swizzle = 6; return 1;  /* R000: A8 */
+   case PIPE_FORMAT_L8A8_UNORM:     *fmt = 0x07; *swizzle = 2; return 2;  /* GRRR: LA8 */
+   default:                         return 0;
+   }
+}
+
+/* the texel bytes of res's copy: its own, or RGBA8's */
+static unsigned
+copy_bytes(const struct sgx_resource *res)
+{
+   uint32_t fmt, swizzle;
+   unsigned b = native_format(res->base.format, &fmt, &swizzle);
+
+   return b ? b : 4;
+}
+
+/* Rows y0..y1, columns x0..x1 of a level of the copy, from the linear
+ * content: the texels as they are (native, b bytes) or made RGBA8 (row: a
+ * row's worth of room) */
+static void
+copy_level(const struct sgx_resource *res, unsigned level, unsigned face_layer, uint8_t *dst,
+           unsigned dw, unsigned dh, bool scale, unsigned x0, unsigned y0, unsigned x1,
+           unsigned y1, uint32_t *row, const struct twiddle *t)
+{
+   const struct pipe_resource *p = &res->base;
+   unsigned lw = u_minify(p->width0, level), lh = u_minify(p->height0, level);
+   const uint8_t *src = (const uint8_t *)res->bo->map + res->offset[level] +
+                        face_layer * res->layer_size[level];
+   uint32_t fmt, swizzle;
+   unsigned native = native_format(p->format, &fmt, &swizzle);
+   /* the columns of content the box reads (padding: the last one) */
+   unsigned cx0 = scale ? 0 : MIN2(x0, lw - 1), cx1 = scale ? lw : MAX2(MIN2(x1, lw), cx0 + 1);
+   unsigned bytes = util_format_get_blocksize(p->format);
+
+   for (unsigned y = y0; y < y1; y++) {
+      unsigned sy = scale ? (2 * y + 1) * lh / (2 * dh) : MIN2(y, lh - 1);
+      const uint8_t *line = src + sy * res->stride[level];
+
+      /* padding: the last column and row repeated (a bilinear lookup at
+       * the edge reads it) */
+#define SX(x) ((scale ? (2 * (x) + 1) * lw / (2 * dw) : MIN2((x), lw - 1)) - cx0)
+      /* (the row read in one go: the linear content is mapped
+       * write-combined, word by word reads of it were slower than the
+       * unpacking) */
+      if (native)
+         memcpy(row, line + cx0 * bytes, (cx1 - cx0) * bytes);
+      else
+         unpack_row(p->format, line + cx0 * bytes, cx1 - cx0, row);
+      switch (native) {
+      case 1:
+         for (unsigned x = x0; x < x1; x++)
+            dst[twiddle_at(t, x, y)] = ((const uint8_t *)row)[SX(x)];
+         break;
+      case 2:
+         for (unsigned x = x0; x < x1; x++)
+            ((uint16_t *)dst)[twiddle_at(t, x, y)] = ((const uint16_t *)row)[SX(x)];
+         break;
+      default:
+         for (unsigned x = x0; x < x1; x++)
+            ((uint32_t *)dst)[twiddle_at(t, x, y)] = row[SX(x)];
+         break;
+      }
+#undef SX
+   }
+}
+
+static bool
+copy_texture(struct sgx_context *ctx, struct sgx_resource *res, unsigned first)
+{
+   struct sgx_screen *screen = sgx_screen(res->base.screen);
    struct pipe_resource *p = &res->base;
    unsigned w = u_minify(p->width0, first), h = u_minify(p->height0, first);
    unsigned tw = util_next_power_of_two(w), th = util_next_power_of_two(h);
    unsigned faces = p->target == PIPE_TEXTURE_CUBE ? 6 : 1;
    unsigned levels = p->last_level + 1 - first;
+   unsigned b = copy_bytes(res);
    bool scale = faces > 1 && (tw != w || th != h);
-   uint32_t size = 0, face = 0, *dst, *row;
-   const uint8_t *map;
+   bool same = res->tw && res->tw_w == tw && res->tw_h == th && res->tw_levels == levels &&
+               res->tw_first == first;
+   /* boxes of level 0 alone written since the copy was made */
+   bool boxed = same && faces == 1 && levels == 1 && !first &&
+                !util_format_is_compressed(p->format) && res->tw_writes &&
+                res->tw_writes == res->seq - res->tw_seq;
+   uint32_t size = 0, face = 0, lo = 0, hi, *row;
+   unsigned x0 = 0, y0 = 0, x1 = tw, y1 = th;
+   uint8_t *out;
+   struct twiddle t;
+   bool fresh, partial;
 
    for (unsigned l = 0; l < levels; l++)
-      size += MAX2(tw >> l, 1) * MAX2(th >> l, 1) * 4;
+      size += MAX2(tw >> l, 1) * MAX2(th >> l, 1) * b;
    for (unsigned l = 0; faces > 1 && (tw >> l || th >> l); l++)
-      face += MAX2(tw >> l, 1) * MAX2(th >> l, 1) * 4;
+      face += MAX2(tw >> l, 1) * MAX2(th >> l, 1) * b;
    if (faces > 1 && tw >= 16 && th >= 16)
       face = align(face, 2048);
    if (faces > 1)
       size = 5 * face + size;
-   if (!res->tw || res->tw_w != tw || res->tw_h != th || res->tw_levels != levels ||
-       res->tw_first != first) {
-      sgx_bo_destroy(res->tw);
-      res->tw = sgx_bo_create(&screen->dev, size, 0, 0);
-      if (!res->tw || !sgx_bo_map(res->tw)) {
-         sgx_bo_destroy(res->tw);
-         res->tw = NULL;
-         return false;
+   hi = size;
+   if (!same || (!boxed && res->tw_cpu)) {
+      FREE(res->tw_cpu);
+      res->tw_cpu = NULL;
+   }
+   /* the first box written: from now on a shadow of the copy */
+   partial = boxed && res->tw_cpu;
+   if (boxed && !res->tw_cpu)
+      res->tw_cpu = MALLOC(size);
+   if (partial) {
+      /* (the padding of the box's last column and row too) */
+      x0 = res->tw_x0;
+      y0 = res->tw_y0;
+      x1 = res->tw_x1 >= w ? tw : res->tw_x1;
+      y1 = res->tw_y1 >= h ? th : res->tw_y1;
+   }
+   /* a new copy, or the old one again if no render reads it -- or if a
+    * small box of a big copy changed: then the renders that read it go
+    * first and are waited for, cheaper than copying all of it over (64
+    * boxes of 16 x 16 into 1024 x 1024: 1.2 s the other way, glupload) */
+   if (partial && same && size >= (512u << 10) && res->tw_cpu) {
+      unsigned bw = (x1 - x0) * (y1 - y0) * b * 4;
+
+      if (bw <= size / 8) {
+         if (sgx_batch_reads(ctx, res->tw))
+            sgx_batch_flush(ctx);
+         if (!sgx_bo_idle(res->tw))
+            sgx_bo_wait(res->tw, -1);
       }
+   }
+   fresh = !same || sgx_batch_reads(ctx, res->tw) || !sgx_bo_idle(res->tw);
+   if (fresh) {
+      struct sgx_bo *bo = sgx_bo_cache_get(&screen->dev, size);
+
+      if (!bo)
+         return false;
+      sgx_bo_destroy(res->tw);
+      res->tw = bo;
       res->tw_w = tw;
       res->tw_h = th;
       res->tw_levels = levels;
       res->tw_first = first;
-   } else {
-      /* a render may still be sampling the old copy */
-      sgx_frame_finish(screen->frame);
    }
-   if (!(map = sgx_bo_map(res->bo)) || !(row = MALLOC(MAX2(w, 1) * 4)))
+   out = res->tw_cpu ? res->tw_cpu : MALLOC(size);
+   row = MALLOC(MAX2(tw, 1) * 4);
+   if (!out || !row || !sgx_bo_map(res->bo)) {
+      if (out != res->tw_cpu)
+         FREE(out);
+      FREE(row);
       return false;
+   }
    /* what the GPU wrote into the texture, done first */
-   sgx_bo_wait(res->bo, -1);
+   if (res->gpu_written || res->external)
+      sgx_bo_wait(res->bo, -1);
    for (unsigned f = 0; f < faces; f++) {
-      dst = (uint32_t *)(res->tw->map + f * face);
+      uint8_t *dst = out + f * face;
+
       for (unsigned l = 0; l < levels; l++) {
-         unsigned lw = u_minify(w, l), lh = u_minify(h, l);
          unsigned dw = MAX2(tw >> l, 1), dh = MAX2(th >> l, 1);
-         const uint8_t *src = map + res->offset[first + l] + f * res->layer_size[first + l];
 
-         for (unsigned y = 0; y < dh; y++) {
-            unsigned sy = scale ? (2 * y + 1) * lh / (2 * dh) : MIN2(y, lh - 1);
-
-            unpack_row(p->format, src + sy * res->stride[first + l], lw, row);
-            /* padding: the last column and row repeated (a bilinear lookup
-             * at the edge reads it) */
-            for (unsigned x = 0; x < dw; x++)
-               dst[twiddle(x, y, dw, dh)] =
-                  row[scale ? (2 * x + 1) * lw / (2 * dw) : MIN2(x, lw - 1)];
+         if (!twiddle_init(&t, dw, dh)) {
+            if (out != res->tw_cpu)
+               FREE(out);
+            FREE(row);
+            return false;
          }
-         dst += dw * dh;
+         if (partial) {
+            copy_level(res, first + l, f, dst, dw, dh, scale, x0, y0, x1, y1, row, &t);
+            lo = twiddle_at(&t, x0, y0) * b;
+            hi = (twiddle_at(&t, x1 - 1, y1 - 1) + 1) * b;
+         } else {
+            copy_level(res, first + l, f, dst, dw, dh, scale, 0, 0, dw, dh, row, &t);
+         }
+         FREE(t.mx);
+         dst += dw * dh * b;
       }
    }
    FREE(row);
+   /* a new buffer takes all of it; the old one the range the box is in */
+   if (fresh)
+      lo = 0, hi = size;
+   memcpy((uint8_t *)res->tw->map + lo, out + lo, hi - lo);
+   if (out != res->tw_cpu)
+      FREE(out);
    /* SGX_TEX_PROBE=1: a cube map's copy holds each texel's own index
     * instead (finding the layout: glmip --probe) */
-   if (faces > 1 && getenv("SGX_TEX_PROBE"))
-      for (uint32_t i = 0; i < res->tw->size / 4; i++)
+   if (faces > 1 && b == 4 && getenv("SGX_TEX_PROBE"))
+      for (uint32_t i = 0; i < size / 4; i++)
          ((uint32_t *)res->tw->map)[i] = 0xff000000u | i;
+   /* SGX_DEBUG=copies: each copy made, what of it and why */
+   {
+      static int on = -1;
+
+      if (on < 0)
+         on = getenv("SGX_DEBUG") && strstr(getenv("SGX_DEBUG"), "copies");
+      if (on)
+         mesa_logi("sgx: copy %p %s %ux%u l%u: %s, %s buffer, %u bytes (%u writes, seq +%u%s%s)",
+                   (void *)res, util_format_short_name(p->format), w, h, levels,
+                   partial ? "a box" : "all", fresh ? "a new" : "the same", hi - lo,
+                   res->tw_writes, res->seq - res->tw_seq, res->gpu_written ? ", GPU-written" : "",
+                   same ? "" : ", new size");
+   }
    res->tw_seq = res->seq;
+   res->tw_writes = 0;
    return true;
 }
 
@@ -331,37 +528,27 @@ sampler_bits(const struct pipe_sampler_state *ss)
 }
 
 bool
-sgx_resource_linear(const struct sgx_resource *res, bool *swap, bool *x8)
+sgx_resource_linear(const struct sgx_resource *res, const struct pipe_sampler_state *ss)
 {
    const struct pipe_resource *p = &res->base;
    static int force = -1;
+   uint32_t fmt, swizzle;
 
    if (force < 0)
       force = getenv("SGX_LINEAR_TEX") ? atoi(getenv("SGX_LINEAR_TEX")) : 2;
-   *swap = *x8 = false;
-   switch (p->format) {
-   case PIPE_FORMAT_R8G8B8X8_UNORM:
-      *x8 = true;
-      FALLTHROUGH;
-   case PIPE_FORMAT_R8G8B8A8_UNORM:
-      *swap = true;
-      break;
-   case PIPE_FORMAT_B8G8R8X8_UNORM:
-      *x8 = true;
-      FALLTHROUGH;
-   case PIPE_FORMAT_B8G8R8A8_UNORM:
-      break;
-   default:
-      return false;
-   }
    /* SGX_LINEAR_TEX=0: never, 1: whenever it can */
-   if (force == 0 || p->last_level || p->array_size > 1 || (res->stride[0] & 15) ||
-       res->stride[0] < 32 || ((res->offset[0] + res->bo->va) & 15) ||
+   if (force == 0 || !native_format(p->format, &fmt, &swizzle) || p->last_level ||
+       p->array_size > 1 || (res->stride[0] & 15) || res->stride[0] < 32 ||
+       ((res->offset[0] + res->bo->va) & 15) ||
        (p->target != PIPE_TEXTURE_2D && p->target != PIPE_TEXTURE_RECT))
       return false;
    /* (a size not a power of two is twiddled too, M28: the minification
-    * filter is lost here) */
-   return force == 1 || res->external || res->gpu_written;
+    * filter is lost here) -- and, M37, one sampled with the nearest texel
+    * when minified: nothing is lost then, and no copy is made (glamor's
+    * masks, a new texture of the window's size at every step of a window
+    * dragged, were copied once each) */
+   return force == 1 || res->external || res->gpu_written ||
+          (ss && ss->min_img_filter == PIPE_TEX_FILTER_NEAREST);
 }
 
 /* The levels a lookup through view with ss may take (M35): from *first
@@ -391,50 +578,41 @@ sampled_levels(const struct sgx_resource *res, const struct pipe_sampler_view *v
 }
 
 bool
-sgx_resource_copy_stale(const struct sgx_resource *res, const struct pipe_sampler_view *view,
-                        const struct pipe_sampler_state *ss)
-{
-   unsigned first, last;
-   bool swap, x8;
-
-   if (sgx_resource_linear(res, &swap, &x8))
-      return false;
-   sampled_levels(res, view, ss, &first, &last);
-   return !res->tw || res->tw_seq != res->seq || res->tw_first != first;
-}
-
-bool
-sgx_resource_texture(struct sgx_screen *screen, struct sgx_resource *res,
+sgx_resource_texture(struct sgx_context *ctx, struct sgx_resource *res,
                      const struct pipe_sampler_view *view,
                      const struct pipe_sampler_state *ss, uint32_t words[4])
 {
-   bool swap, x8;
-
    struct pipe_resource *p = &res->base;
 
    if ((p->target != PIPE_TEXTURE_1D && p->target != PIPE_TEXTURE_2D &&
         p->target != PIPE_TEXTURE_RECT && p->target != PIPE_TEXTURE_CUBE) ||
        p->array_size != (p->target == PIPE_TEXTURE_CUBE ? 6 : 1) || !p->width0 || !p->height0)
       return false;
-   if (sgx_resource_linear(res, &swap, &x8)) {
+   if (sgx_resource_linear(res, ss)) {
+      uint32_t fmt, swizzle;
+
       /* the 2D engine's way (apple_sgx_hw.c, blt_tex: iOS's for an
        * IOSurface): the content itself, its stride in 16 bytes less 2;
        * bits 11:9 all set, or the rows come out skewed -- every other value
        * of the three was tried (gltex), and the minification filter they
-       * are for twiddled textures is lost: point sampling */
+       * are for twiddled textures is lost: point sampling.  Type 6 (GXM's
+       * linear strided), the format and its swizzle as a copy's (M37: the
+       * sampler reads B G R A by swizzle 1, ARGB, not by itself) */
+      native_format(p->format, &fmt, &swizzle);
       words[0] = (res->stride[0] / 16 - 2) << 16 | (sampler_bits(ss) & ~0xe00u) | 7u << 9;
-      words[1] = 0xcc000000 | (p->width0 - 1) << 12 | (p->height0 - 1);
+      words[1] = 6u << 29 | fmt << 24 | (p->width0 - 1) << 12 | (p->height0 - 1);
       words[2] = res->bo->va + res->offset[0];
-      words[3] = 0x10000000;
+      words[3] = swizzle << 28;
       res->sampled = res->bo;
    } else {
       bool cube = p->target == PIPE_TEXTURE_CUBE;
       unsigned first, last, w, h;
+      uint32_t fmt, swizzle;
       int bias;
 
       sampled_levels(res, view, ss, &first, &last);
       if ((!res->tw || res->tw_seq != res->seq || res->tw_first != first) &&
-          !copy_texture(screen, res, first))
+          !copy_texture(ctx, res, first))
          return false;
       w = u_minify(p->width0, first);
       h = u_minify(p->height0, first);
@@ -449,13 +627,14 @@ sgx_resource_texture(struct sgx_screen *screen, struct sgx_resource *res,
        * t04, 0x4c020002 -- 5 twiddled of any size, 6 strided: GXM's
        * SceGxmTextureType), the format in 28:24, the size: log2 w in 19:16
        * and log2 h in 3:0, or w - 1 in 23:12 and h - 1 in 11:0 */
+      native_format(p->format, &fmt, &swizzle);
       if (cube || (util_is_power_of_two_nonzero(w) && util_is_power_of_two_nonzero(h)))
-         words[1] = (cube ? 2u << 29 : 0) | 0x0c000000 |
+         words[1] = (cube ? 2u << 29 : 0) | fmt << 24 |
                     util_logbase2(res->tw_w) << 16 | util_logbase2(res->tw_h);
       else
-         words[1] = 5u << 29 | 0x0c000000 | (w - 1) << 12 | (h - 1);
+         words[1] = 5u << 29 | fmt << 24 | (w - 1) << 12 | (h - 1);
       words[2] = res->tw->va;
-      words[3] = 0;
+      words[3] = swizzle << 28;
       res->sampled = res->tw;
    }
    /* SGX_TEX_WORDn=mask: bits of word n flipped, to find what they do */
@@ -603,11 +782,18 @@ sgx_transfer_map(struct pipe_context *pctx, struct pipe_resource *prsc, unsigned
 
    /* draws gathered but not rendered that write or read it go first, and
     * renders that do -- not for a buffer: its CPU copy is no render's
-    * (M26: sgx_buffer_bo) */
+    * (M26: sgx_buffer_bo).  Nor for a texture whose linear content no
+    * render reads -- sampled through its copy -- or writes (M37): it is the
+    * CPU's alone (glamor's glyphs went one render and a wait each). */
    if (!(usage & PIPE_MAP_UNSYNCHRONIZED) && prsc->target != PIPE_BUFFER) {
-      if (sgx_batch_uses(ctx, prsc))
+      bool gpu = res->gpu_written || res->external ||
+                 util_format_is_depth_or_stencil(prsc->format) ||
+                 ctx->batch.rt == prsc || ctx->batch.zs == prsc ||
+                 sgx_batch_reads(ctx, res->bo) || !sgx_bo_idle(res->bo);
+
+      if (gpu && sgx_batch_uses(ctx, prsc))
          sgx_batch_flush(ctx);
-      if (!sgx_bo_wait(res->bo, -1))
+      if (gpu && !sgx_bo_wait(res->bo, -1))
          return NULL;
    }
    /* a depth clear at the start of a render that has no draws yet: the
@@ -694,7 +880,29 @@ sgx_transfer_unmap(struct pipe_context *pctx, struct pipe_transfer *ptrans)
    struct sgx_resource *res = sgx_resource(ptrans->resource);
 
    if (ptrans->usage & PIPE_MAP_WRITE) {
+      const struct pipe_box *box = &ptrans->box;
+
       res->seq++;
+      /* a box of level 0 of a 2D texture of one level: the copy made again
+       * for it alone (M37: copy_texture) */
+      if (ptrans->resource->target != PIPE_BUFFER && !ptrans->level &&
+          !ptrans->resource->last_level && ptrans->resource->array_size == 1 &&
+          (ptrans->resource->target == PIPE_TEXTURE_2D ||
+           ptrans->resource->target == PIPE_TEXTURE_RECT) &&
+          !box->z && box->depth == 1 && box->width > 0 && box->height > 0) {
+         if (!res->tw_writes) {
+            res->tw_x0 = box->x;
+            res->tw_y0 = box->y;
+            res->tw_x1 = box->x + box->width;
+            res->tw_y1 = box->y + box->height;
+         } else {
+            res->tw_x0 = MIN2(res->tw_x0, (unsigned)box->x);
+            res->tw_y0 = MIN2(res->tw_y0, (unsigned)box->y);
+            res->tw_x1 = MAX2(res->tw_x1, (unsigned)(box->x + box->width));
+            res->tw_y1 = MAX2(res->tw_y1, (unsigned)(box->y + box->height));
+         }
+         res->tw_writes++;
+      }
       if (ptrans->resource->target == PIPE_BUFFER && !(ptrans->usage & PIPE_MAP_FLUSH_EXPLICIT))
          buffer_written(res, ptrans->box.x, ptrans->box.x + ptrans->box.width, ptrans->usage);
       if (util_format_is_depth_or_stencil(ptrans->resource->format) &&

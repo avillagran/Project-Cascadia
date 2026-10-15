@@ -558,17 +558,13 @@ fs_for_draw(struct sgx_context *ctx)
     * bytes (iOS's es1 e03..e10) */
    if (ctx->blend && ctx->blend->logicop_enable)
       key.logicop = ctx->blend->logicop_func + 1;
-   /* textures sampled linear in other orders than B G R A (M16) */
+   /* (textures sampled linear in other orders than B G R A, M16: their
+    * swizzle in the state words since M37, as a copy's) sRGB textures */
    for (unsigned i = 0; i < sh->compiled->nsamplers; i++) {
       unsigned unit = sh->compiled->sampler_unit[i];
       struct pipe_sampler_view *view = unit < ARRAY_SIZE(ctx->fs_views) ?
                                        ctx->fs_views[unit] : NULL;
-      bool swap, x8;
 
-      if (unit < 8 && view && sgx_resource_linear(sgx_resource(view->texture), &swap, &x8)) {
-         key.tex_swap |= swap << unit;
-         key.tex_x8 |= x8 << unit;
-      }
       if (unit < 8 && view && util_format_is_srgb(view->format))
          key.tex_srgb |= 1u << unit;
    }
@@ -903,8 +899,13 @@ sgx_batch_flush_at(struct sgx_context *ctx, const char *file, int line)
    pipe_resource_reference(&b->rt, NULL);
    pipe_resource_reference(&b->zs, NULL);
    b->zs_cleared = b->zs_read = b->zs_written = false;
-   for (unsigned i = 0; i < b->ntex; i++)
+   for (unsigned i = 0; i < b->ntex; i++) {
       pipe_resource_reference(&b->tex[i], NULL);
+      if (!ret)
+         sgx_bo_set_busy(b->tex_bo[i], ctx->last);
+      sgx_bo_destroy(b->tex_bo[i]);
+      b->tex_bo[i] = NULL;
+   }
    /* (the kernel keeps the buffers for the render) */
    for (unsigned i = 0; i < b->nbos; i++) {
       if (!ret)
@@ -1048,6 +1049,18 @@ batch_bytes(const struct sgx_batch *b)
  * MiB) kept them all for one render, and the kernel's pages ran out (M35). */
 #define SGX_BATCH_TEX_BYTES (48u << 20)
 
+/* the render's entry for texture p as it is sampled now -- its copy then
+ * -- or b->ntex */
+static unsigned
+tex_entry(const struct sgx_batch *b, struct pipe_resource *p)
+{
+   unsigned k;
+
+   for (k = 0; k < b->ntex && (b->tex[k] != p || b->tex_bo[k] != sgx_resource(p)->sampled); k++)
+      ;
+   return k;
+}
+
 static uint64_t
 tex_bytes(struct pipe_resource *p)
 {
@@ -1064,14 +1077,9 @@ tex_room(struct sgx_context *ctx, struct pipe_resource **tex, unsigned ntex)
    struct sgx_batch *b = &ctx->batch;
    uint64_t n = b->tex_bytes;
 
-   for (unsigned i = 0; i < ntex; i++) {
-      unsigned k;
-
-      for (k = 0; k < b->ntex && b->tex[k] != tex[i]; k++)
-         ;
-      if (k == b->ntex)
+   for (unsigned i = 0; i < ntex; i++)
+      if (tex_entry(b, tex[i]) == b->ntex)
          n += tex_bytes(tex[i]);
-   }
    return !b->ndraws || n <= SGX_BATCH_TEX_BYTES;
 }
 
@@ -1084,13 +1092,8 @@ more_handles(struct sgx_context *ctx, struct pipe_resource **tex, unsigned ntex,
    struct sgx_batch *b = &ctx->batch;
    unsigned n = 0;
 
-   for (unsigned i = 0; i < ntex; i++) {
-      unsigned k;
-
-      for (k = 0; k < b->ntex && b->tex[k] != tex[i]; k++)
-         ;
-      n += k == b->ntex;
-   }
+   for (unsigned i = 0; i < ntex; i++)
+      n += tex_entry(b, tex[i]) == b->ntex;
    for (unsigned i = 0; i < nbos; i++)
       n += bos[i]->batch_ctx != ctx || bos[i]->batch_seq != b->seq;
    return n;
@@ -1105,14 +1108,17 @@ add_handles(struct sgx_context *ctx, struct pipe_resource **tex, unsigned ntex,
    struct sgx_batch *b = &ctx->batch;
 
    for (unsigned i = 0; i < ntex; i++) {
-      unsigned k;
+      struct sgx_bo *bo = sgx_resource(tex[i])->sampled;
 
-      for (k = 0; k < b->ntex && b->tex[k] != tex[i]; k++)
-         ;
-      if (k == b->ntex) {
+      if (tex_entry(b, tex[i]) == b->ntex) {
          b->tex_bytes += tex_bytes(tex[i]);
          pipe_resource_reference(&b->tex[b->ntex], tex[i]);
-         b->handles[b->ntex++] = sgx_resource(tex[i])->sampled->handle;
+         sgx_bo_ref(bo);
+         /* (stamped: sgx_batch_reads() says the copy is the render's) */
+         bo->batch_ctx = ctx;
+         bo->batch_seq = b->seq;
+         b->tex_bo[b->ntex] = bo;
+         b->handles[b->ntex++] = bo->handle;
       }
    }
    for (unsigned i = 0; i < nbos; i++) {
@@ -1443,13 +1449,11 @@ submit(struct sgx_context *ctx)
          const struct pipe_sampler_state *ss = unit < PIPE_MAX_SAMPLERS ?
                                                ctx->fs_samplers[unit] : NULL;
 
-         /* its copy is about to be made again (or it is the target):
-          * what was gathered reads the old one, so render that first --
-          * one sampled as it is has no copy */
-         if (t && sgx_batch_uses(ctx, &t->base) &&
-             (&t->base == b->rt || sgx_resource_copy_stale(t, view, ss)))
+         /* the target itself: what was gathered goes first (a copy made
+          * again while draws read the old one is a new buffer, M37) */
+         if (t && &t->base == b->rt)
             sgx_batch_flush(ctx);
-         if (!t || !sgx_resource_texture(screen, t, view, ss, sa + fs->sampler_sa + 4 * i)) {
+         if (!t || !sgx_resource_texture(ctx, t, view, ss, sa + fs->sampler_sa + 4 * i)) {
             mesa_logw_once("sgx: a draw samples a texture unit with nothing it can "
                            "sample bound: dropped");
             ctx->nverts = 0;

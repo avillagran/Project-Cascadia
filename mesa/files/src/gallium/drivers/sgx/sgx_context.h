@@ -82,6 +82,10 @@ struct sgx_batch {
    uint16_t *idx;
    unsigned nidx, maxidx;
    struct pipe_resource *tex[SGX_FRAME_MAX_HANDLES];   /* sampled, referenced */
+   /* the buffer each was sampled from (its copy then, M37: a copy remade
+    * while draws read the old one is a new buffer -- the same texture
+    * twice), referenced, and busy with the render once it is made */
+   struct sgx_bo *tex_bo[SGX_FRAME_MAX_HANDLES];
    unsigned ntex;
    uint64_t tex_bytes;                  /* the memory they hold (SGX_BATCH_TEX_BYTES) */
    /* the buffers the render lists for the kernel -- the textures' copies,
@@ -173,7 +177,7 @@ struct sgx_context {
    bool warned_fs, debug_draw;
    /* SGX_DEBUG=fps: frames (swaps), renders and draws counted, and said
     * every two seconds */
-   bool debug_fps, debug_sync;
+   bool debug_fps, debug_sync, debug_flushes;
    unsigned stat_frames, stat_renders, stat_draws;
    int64_t stat_t0, stat_cpu0, stat_gpu;
    int64_t stat_swap, stat_between;     /* the last frame's end; to the next draw */

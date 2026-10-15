@@ -114,7 +114,9 @@ sgx_flush(struct pipe_context *pctx, struct pipe_fence_handle **fence, unsigned 
 
    sgx_trace_mark(flags & PIPE_FLUSH_END_OF_FRAME ? "flush, end of frame" : "flush");
    sgx_batch_flush(ctx);
-   if (ctx->debug_fps && (flags & PIPE_FLUSH_END_OF_FRAME)) {
+   /* (SGX_DEBUG=fps,flushes: every flush a frame -- the X server's glamor,
+    * which never swaps) */
+   if (ctx->debug_fps && ((flags & PIPE_FLUSH_END_OF_FRAME) || ctx->debug_flushes)) {
       struct timespec ts;
       int64_t now = os_time_get_nano(), cpu;
 
@@ -816,6 +818,7 @@ sgx_context_create(struct pipe_screen *pscreen, void *priv, unsigned flags)
    p->draw_vbo = sgx_draw_vbo;
    ctx->debug_draw = debug_get_bool_option("SGX_DEBUG_DRAW", false);
    ctx->debug_fps = getenv("SGX_DEBUG") && strstr(getenv("SGX_DEBUG"), "fps");
+   ctx->debug_flushes = getenv("SGX_DEBUG") && strstr(getenv("SGX_DEBUG"), "flushes");
    ctx->debug_sync = getenv("SGX_DEBUG") && strstr(getenv("SGX_DEBUG"), "sync");
    p->texture_barrier = sgx_texture_barrier;
    p->memory_barrier = sgx_memory_barrier;
