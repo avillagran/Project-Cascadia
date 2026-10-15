@@ -2263,6 +2263,7 @@ draw_state(struct sgx_frame *f, const struct sgx_frame_draw *d, const struct sgx
    full[1] = (full[1] & ~(7u << 22 | 1u << 20)) | (uint32_t)(d->st.depth_func & 7) << 22 |
              (d->st.depth_write ? 0 : 1u << 20);
    full[18] = (full[18] & ~3u) | d->st.cull;
+   full[2] = (full[2] & ~(0x3ffu << 16)) | d->st.offset;
    if (d->st.stencil_on) {
       full[3] = d->st.stencil;
       full[1] = (full[1] & ~0xffu) | d->st.stencil_ref;

@@ -74,10 +74,12 @@ sgx_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *tem
 
    /* a buffer: CPU memory, which maps read and write without waiting
     * (M25); the GPU's copy is made when a draw reads it (M26:
-    * sgx_buffer_bo) */
+    * sgx_buffer_bo).  64-byte aligned: GL's MIN_MAP_BUFFER_ALIGNMENT
+    * (musl's malloc gives 16; piglit's map_invalidate cases pass or fail
+    * with where the heap is) */
    if (templ->target == PIPE_BUFFER) {
       simple_mtx_init(&res->dirty_lock, mtx_plain);
-      if (!(res->data = MALLOC(MAX2(size, 1)))) {
+      if (!(res->data = align_malloc(MAX2(size, 1), 64))) {
          FREE(res);
          return NULL;
       }
@@ -108,7 +110,7 @@ sgx_resource_destroy(struct pipe_screen *pscreen, struct pipe_resource *prsc)
    sgx_bo_destroy(res->bo);
    if (res->data)
       simple_mtx_destroy(&res->dirty_lock);
-   FREE(res->data);
+   align_free(res->data);
    FREE(res);
 }
 

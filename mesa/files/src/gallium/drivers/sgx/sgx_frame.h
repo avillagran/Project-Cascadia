@@ -168,6 +168,11 @@ struct sgx_frame_state {
     * colours with any value (gldesk: the first vertex's by turning the
     * triangle round, sgx_draw.c) -- 0 when none */
    uint8_t flat;
+   /* (M37) polygon offset, the ISP's: state word 2 bits 25:21 the slope's
+    * factor, 20:16 the units, each a signed 5-bit integer (iOS's es1 e19,
+    * gloffset --probe); a unit is 32 of 24-bit depth's at depths 0.5..1
+    * (a power of two smaller below: floating point) */
+   uint32_t offset;
 };
 #define SGX_FLAT_LAST  3
 /* the TA's culling (state word 18, bits 1:0): the triangles clockwise or
@@ -221,7 +226,7 @@ sgx_frame_state_equal(const struct sgx_frame_state *x, const struct sgx_frame_st
    return x->depth_func == y->depth_func && x->depth_write == y->depth_write &&
           x->viewport == y->viewport && x->cull == y->cull &&
           x->stencil_on == y->stencil_on && x->stencil == y->stencil &&
-          x->stencil_ref == y->stencil_ref && x->flat == y->flat &&
+          x->stencil_ref == y->stencil_ref && x->flat == y->flat && x->offset == y->offset &&
           (!x->viewport || (x->scale[0] == y->scale[0] && x->scale[1] == y->scale[1] &&
                             x->scale[2] == y->scale[2] && x->translate[0] == y->translate[0] &&
                             x->translate[1] == y->translate[1] &&

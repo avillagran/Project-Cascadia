@@ -6,6 +6,7 @@
 #define SGX_CONTEXT_H
 
 #include "pipe/p_context.h"
+#include "util/u_debug.h"
 #include "pipe/p_state.h"
 #include "util/slab.h"
 
@@ -189,6 +190,21 @@ sgx_context(struct pipe_context *p)
 {
    return (struct sgx_context *)p;
 }
+
+/* what the rasterizer state's polygon offset units are times GL's, for
+ * the draw module (sgx_create_rs_state): 4, or with the ISP's offset
+ * (SGX_ISP_OFFSET=1, M37) 16 -- its unit, 32 of 24-bit depth's at depths
+ * 0.5..1, the draw module doubling it -- the same on both vertex paths */
+static inline float
+sgx_offset_scale(void)
+{
+   static int isp = -1;
+
+   if (isp < 0)
+      isp = debug_get_bool_option("SGX_ISP_OFFSET", false);
+   return isp ? 16.0f : 4.0f;
+}
+#define SGX_OFFSET_SCALE sgx_offset_scale()
 
 /* whether the gathered draws read bo (a buffer's GPU copy, M26) */
 static inline bool

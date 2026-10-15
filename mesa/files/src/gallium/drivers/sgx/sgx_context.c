@@ -435,9 +435,9 @@ sgx_create_rs_state(struct pipe_context *pctx, const struct pipe_rasterizer_stat
    /* polygon offset's unit: 24-bit depth's (sgx_draw_init) is a bit or two
     * of the tiles' F32 depth, lost between the draw module's z and the
     * ISP's interpolated one; four of them are not (dEQP's displacement
-    * cases pass from two) */
+    * cases pass from two; SGX_OFFSET_SCALE) */
    if (r)
-      r->offset_units *= 4;
+      r->offset_units *= SGX_OFFSET_SCALE;
    return r;
 }
 

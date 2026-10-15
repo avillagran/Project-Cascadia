@@ -90,8 +90,10 @@ for t in glclear gltri glfs gltex glblend gldepth glspeed glpersp glsize glseam 
         -Wl,-rpath-link,"$I/lib" -Wl,-rpath,"$PREFIX/lib" -o "$I/bin/$t"
 done
 # desktop OpenGL (libGL) through EGL
-cc -O2 -Wall -I"$I/include" "$ROOT/tools/sgx/gl/gldesk.c" -L"$I/lib" -lEGL -lGL -lm \
-    -Wl,-rpath-link,"$I/lib" -Wl,-rpath,"$PREFIX/lib" -o "$I/bin/gldesk"
+for t in gldesk gloffset; do
+    cc -O2 -Wall -I"$I/include" "$ROOT/tools/sgx/gl/$t.c" -L"$I/lib" -lEGL -lGL -lm \
+        -Wl,-rpath-link,"$I/lib" -Wl,-rpath,"$PREFIX/lib" -o "$I/bin/$t"
+done
 # on the screen: GBM and KMS besides
 cc -O2 -Wall -I"$I/include" $(pkg-config --cflags libdrm) "$ROOT/tools/sgx/gl/glkms.c" \
     -L"$I/lib" -lEGL -lGLESv2 -lgbm $(pkg-config --libs libdrm) -lm \

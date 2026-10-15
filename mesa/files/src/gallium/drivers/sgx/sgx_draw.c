@@ -302,6 +302,8 @@ render_index(struct sgx_render *sr, unsigned index)
                ctx->verts + ctx->nverts++ * vf);
 }
 
+static uint32_t isp_offset(const struct pipe_rasterizer_state *r);
+
 /* (M37) flat colours from a triangle's first vertex (ARB_provoking_vertex):
  * the TSP takes its last one's whatever state word 18 says (gldesk), so
  * each triangle is turned round to end with it -- the winding the same */
@@ -1390,6 +1392,10 @@ submit(struct sgx_context *ctx)
       else if (r->cull_face == PIPE_FACE_FRONT)
          st.cull = r->front_ccw ? SGX_CULL_CCW : SGX_CULL_CW;
    }
+   /* polygon offset (M37): the ISP's on the GPU's vertex path (the draw
+    * module offsets its vertices itself) */
+   if (vs && isp_offset(ctx->rast) != ~0u)
+      st.offset = isp_offset(ctx->rast);
    /* flat shading (M37): iOS's word (the first vertex's colours by the
     * triangles turned round: flat_first()) */
    if (fs && fs->prog.ncolours)
@@ -1779,6 +1785,26 @@ index_at(const void *indices, unsigned size, unsigned i, unsigned *out)
    }
 }
 
+/* GL's polygon offset as the ISP's (state word 2, M37): whole factors and
+ * units, -16..15 each (units GL's, the ISP's unit its r -- iOS's); 0 none,
+ * ~0u one it does not do.  Not unless SGX_ISP_OFFSET=1: the ISP does not
+ * clamp the depth it offsets to 0..1 (gloffset --clamp, every bit of the
+ * state words near flipped), and dEQP's result_depth_clamp and
+ * factor_1_slope cases want it -- the draw module's offset it is, its
+ * vertices' depth clamped. */
+static uint32_t
+isp_offset(const struct pipe_rasterizer_state *r)
+{
+   float u = r ? r->offset_units / SGX_OFFSET_SCALE : 0, f = r ? r->offset_scale : 0;
+
+   if (!r || !r->offset_tri || (u == 0.0f && f == 0.0f))
+      return 0;
+   if (SGX_OFFSET_SCALE != 16.0f || u != rintf(u) || f != rintf(f) || u < -16 || u > 15 || f < -16 || f > 15 ||
+       r->offset_clamp != 0.0f)
+      return ~0u;
+   return ((uint32_t)(int)f & 0x1f) << 21 | ((uint32_t)(int)u & 0x1f) << 16;
+}
+
 /* What the GPU's vertex side does not do yet: then the draw module's way */
 static bool
 gpu_vs_can_draw(struct sgx_context *ctx, const struct pipe_draw_info *info)
@@ -1797,9 +1823,8 @@ gpu_vs_can_draw(struct sgx_context *ctx, const struct pipe_draw_info *info)
        r->cull_face == PIPE_FACE_FRONT_AND_BACK ||
        r->fill_front != PIPE_POLYGON_MODE_FILL || r->fill_back != PIPE_POLYGON_MODE_FILL ||
        r->clip_plane_enable ||
-       /* polygon offset: the draw module's (the TA's not found yet) */
-       ((r->offset_tri || r->offset_point || r->offset_line) &&
-        (r->offset_units != 0.0f || r->offset_scale != 0.0f)))
+       /* polygon offset the ISP has not: the draw module's */
+       isp_offset(r) == ~0u)
       return false;
    return true;
 }
