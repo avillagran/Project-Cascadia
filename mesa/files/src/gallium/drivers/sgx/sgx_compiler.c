@@ -658,6 +658,17 @@ out:
    }
 }
 
+/* a varying the vertex side hands over as it does the generic ones: the
+ * colours, fog, texture coordinates -- and the back colours (M37: st's
+ * nir_lower_two_sided_color picks them by gl_FrontFacing in the program) */
+static bool
+colour_or_generic(int slot)
+{
+   return slot >= VARYING_SLOT_VAR0 ||
+          (slot >= VARYING_SLOT_COL0 && slot <= VARYING_SLOT_TEX7) ||
+          slot == VARYING_SLOT_BFC0 || slot == VARYING_SLOT_BFC1;
+}
+
 /* a fragment shader input's varying slot, -1 if it is not a varying read
  * at a constant offset */
 static int
@@ -697,7 +708,7 @@ fetch_slot(nir_tex_instr *tex)
           (in = nir_def_as_intrinsic(x.def))->intrinsic != nir_intrinsic_load_input)
          return -1;
       at = input_slot(in);
-      if (at < 0 || (at < VARYING_SLOT_VAR0 && (at < VARYING_SLOT_COL0 || at > VARYING_SLOT_TEX7)) ||
+      if (at < 0 || !colour_or_generic(at) ||
           nir_intrinsic_component(in) + x.comp != i || (i && at != slot))
          return -1;
       slot = at;
@@ -1010,8 +1021,7 @@ intrinsic(struct comp *c, nir_intrinsic_instr *in)
          }
          slot = nir_intrinsic_io_semantics(in).location + nir_src_as_uint(*offset);
          comp = nir_intrinsic_component(in);
-         if (slot < VARYING_SLOT_VAR0 &&
-             (slot < VARYING_SLOT_COL0 || slot > VARYING_SLOT_TEX7)) {
+         if (!colour_or_generic(slot)) {
             fail(c, "input %s", gl_varying_slot_name_for_stage(slot, MESA_SHADER_FRAGMENT));
             return;
          }
