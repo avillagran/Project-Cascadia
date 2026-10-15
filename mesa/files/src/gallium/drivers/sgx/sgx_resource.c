@@ -9,6 +9,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <xf86drm.h>
@@ -210,7 +211,10 @@ unpack_row(enum pipe_format format, const uint8_t *line, unsigned w, uint32_t *r
       for (unsigned x = 0; x < w; x++)
          row[x] = 0xff000000u | 0x010101u * (uint32_t)(CLAMP(z[x], 0.0f, 1.0f) * 255.0f + 0.5f);
    } else {
-      util_format_unpack_rgba_8unorm_rect(format, (uint8_t *)row, w * 4, line, 0, w, 1);
+      /* (sRGB as the bytes are: the program decodes them, or not, as the
+       * view says) */
+      util_format_unpack_rgba_8unorm_rect(util_format_linear(format), (uint8_t *)row, w * 4,
+                                          line, 0, w, 1);
    }
 }
 
@@ -229,13 +233,13 @@ unpack_row(enum pipe_format format, const uint8_t *line, unsigned w, uint32_t *r
  * type 7, read past the copy here and hung the renders): a direction cannot
  * be scaled to a part of a face. */
 static bool
-copy_texture(struct sgx_screen *screen, struct sgx_resource *res)
+copy_texture(struct sgx_screen *screen, struct sgx_resource *res, unsigned first)
 {
    struct pipe_resource *p = &res->base;
-   unsigned w = p->width0, h = p->height0;
+   unsigned w = u_minify(p->width0, first), h = u_minify(p->height0, first);
    unsigned tw = util_next_power_of_two(w), th = util_next_power_of_two(h);
    unsigned faces = p->target == PIPE_TEXTURE_CUBE ? 6 : 1;
-   unsigned levels = p->last_level + 1;
+   unsigned levels = p->last_level + 1 - first;
    bool scale = faces > 1 && (tw != w || th != h);
    uint32_t size = 0, face = 0, *dst, *row;
    const uint8_t *map;
@@ -248,7 +252,8 @@ copy_texture(struct sgx_screen *screen, struct sgx_resource *res)
       face = align(face, 2048);
    if (faces > 1)
       size = 5 * face + size;
-   if (!res->tw || res->tw_w != tw || res->tw_h != th || res->tw_levels != levels) {
+   if (!res->tw || res->tw_w != tw || res->tw_h != th || res->tw_levels != levels ||
+       res->tw_first != first) {
       sgx_bo_destroy(res->tw);
       res->tw = sgx_bo_create(&screen->dev, size, 0, 0);
       if (!res->tw || !sgx_bo_map(res->tw)) {
@@ -259,6 +264,7 @@ copy_texture(struct sgx_screen *screen, struct sgx_resource *res)
       res->tw_w = tw;
       res->tw_h = th;
       res->tw_levels = levels;
+      res->tw_first = first;
    } else {
       /* a render may still be sampling the old copy */
       sgx_frame_finish(screen->frame);
@@ -272,12 +278,12 @@ copy_texture(struct sgx_screen *screen, struct sgx_resource *res)
       for (unsigned l = 0; l < levels; l++) {
          unsigned lw = u_minify(w, l), lh = u_minify(h, l);
          unsigned dw = MAX2(tw >> l, 1), dh = MAX2(th >> l, 1);
-         const uint8_t *src = map + res->offset[l] + f * res->layer_size[l];
+         const uint8_t *src = map + res->offset[first + l] + f * res->layer_size[first + l];
 
          for (unsigned y = 0; y < dh; y++) {
             unsigned sy = scale ? (2 * y + 1) * lh / (2 * dh) : MIN2(y, lh - 1);
 
-            unpack_row(p->format, src + sy * res->stride[l], lw, row);
+            unpack_row(p->format, src + sy * res->stride[first + l], lw, row);
             /* padding: the last column and row repeated (a bilinear lookup
              * at the edge reads it) */
             for (unsigned x = 0; x < dw; x++)
@@ -358,16 +364,56 @@ sgx_resource_linear(const struct sgx_resource *res, bool *swap, bool *x8)
    return force == 1 || res->external || res->gpu_written;
 }
 
+/* The levels a lookup through view with ss may take (M35): from *first
+ * to *last.  The sampler's own are from its copy's level 0 to the last
+ * level in word 0, so GL's base and maximum levels and its LOD clamps are
+ * the copy's: it starts at the base level -- or, with a minimum LOD m, m
+ * levels further (the sampler's LOD, worked out from that level's size, is
+ * then GL's less m, and its level 0 GL's level m: max(lambda, m)) -- and
+ * the last level is the maximum level's or the maximum LOD's.  Exact for
+ * whole numbers. */
+static void
+sampled_levels(const struct sgx_resource *res, const struct pipe_sampler_view *view,
+               const struct pipe_sampler_state *ss, unsigned *first, unsigned *last)
+{
+   unsigned base = view ? MIN2(view->u.tex.first_level, res->base.last_level) : 0;
+   unsigned top = view ? CLAMP(view->u.tex.last_level, base, res->base.last_level) :
+                         res->base.last_level;
+
+   *first = *last = base;
+   if (!ss || ss->min_mip_filter == PIPE_TEX_MIPFILTER_NONE)
+      return;
+   if (ss->max_lod < (float)(top - base))
+      top = base + (unsigned)MAX2(ss->max_lod, 0.0f);
+   *last = top;
+   if (ss->min_lod > 0)
+      *first = MIN2(base + (unsigned)ceilf(ss->min_lod), top);
+}
+
+bool
+sgx_resource_copy_stale(const struct sgx_resource *res, const struct pipe_sampler_view *view,
+                        const struct pipe_sampler_state *ss)
+{
+   unsigned first, last;
+   bool swap, x8;
+
+   if (sgx_resource_linear(res, &swap, &x8))
+      return false;
+   sampled_levels(res, view, ss, &first, &last);
+   return !res->tw || res->tw_seq != res->seq || res->tw_first != first;
+}
+
 bool
 sgx_resource_texture(struct sgx_screen *screen, struct sgx_resource *res,
+                     const struct pipe_sampler_view *view,
                      const struct pipe_sampler_state *ss, uint32_t words[4])
 {
    bool swap, x8;
 
    struct pipe_resource *p = &res->base;
 
-   if ((p->target != PIPE_TEXTURE_2D && p->target != PIPE_TEXTURE_RECT &&
-        p->target != PIPE_TEXTURE_CUBE) ||
+   if ((p->target != PIPE_TEXTURE_1D && p->target != PIPE_TEXTURE_2D &&
+        p->target != PIPE_TEXTURE_RECT && p->target != PIPE_TEXTURE_CUBE) ||
        p->array_size != (p->target == PIPE_TEXTURE_CUBE ? 6 : 1) || !p->width0 || !p->height0)
       return false;
    if (sgx_resource_linear(res, &swap, &x8)) {
@@ -383,27 +429,31 @@ sgx_resource_texture(struct sgx_screen *screen, struct sgx_resource *res,
       res->sampled = res->bo;
    } else {
       bool cube = p->target == PIPE_TEXTURE_CUBE;
+      unsigned first, last, w, h;
+      int bias;
 
-      if ((!res->tw || res->tw_seq != res->seq) && !copy_texture(screen, res))
+      sampled_levels(res, view, ss, &first, &last);
+      if ((!res->tw || res->tw_seq != res->seq || res->tw_first != first) &&
+          !copy_texture(screen, res, first))
          return false;
+      w = u_minify(p->width0, first);
+      h = u_minify(p->height0, first);
       /* bits 20:17 the last level the sampler goes down to (iOS's 4 x 4
        * cube map, one level, has 0; glmip): with no mip filter, level 0's
-       * alone; bits 26:21 the LOD bias, 31 none (Vita3K's SceGxmTexture,
-       * the same words) */
-      words[0] = 0x03e00000 |
-                 (ss && ss->min_mip_filter != PIPE_TEX_MIPFILTER_NONE ?
-                  (res->tw_levels - 1) << 17 : 0) |
-                 sampler_bits(ss);
+       * alone; bits 26:21 the LOD bias in eighths, 31 none (iOS's corpus:
+       * 39 for 1.0, 43 for 1.5 -- Vita3K's SceGxmTexture, the same words) */
+      bias = 31 + (ss ? (int)lroundf(ss->lod_bias * 8) : 0);
+      words[0] = (uint32_t)CLAMP(bias, 0, 63) << 21 |
+                 MIN2(last - first, res->tw_levels - 1) << 17 | sampler_bits(ss);
       /* word 1: the type in bits 31:29 (0 twiddled, 2 a cube map -- iOS's
        * t04, 0x4c020002 -- 5 twiddled of any size, 6 strided: GXM's
        * SceGxmTextureType), the format in 28:24, the size: log2 w in 19:16
        * and log2 h in 3:0, or w - 1 in 23:12 and h - 1 in 11:0 */
-      if (cube || (util_is_power_of_two_nonzero(p->width0) &&
-                   util_is_power_of_two_nonzero(p->height0)))
+      if (cube || (util_is_power_of_two_nonzero(w) && util_is_power_of_two_nonzero(h)))
          words[1] = (cube ? 2u << 29 : 0) | 0x0c000000 |
                     util_logbase2(res->tw_w) << 16 | util_logbase2(res->tw_h);
       else
-         words[1] = 5u << 29 | 0x0c000000 | (p->width0 - 1) << 12 | (p->height0 - 1);
+         words[1] = 5u << 29 | 0x0c000000 | (w - 1) << 12 | (h - 1);
       words[2] = res->tw->va;
       words[3] = 0;
       res->sampled = res->tw;
@@ -434,6 +484,114 @@ sgx_resource_screen_init(struct sgx_screen *screen)
    screen->base.resource_from_handle = sgx_resource_from_handle;
 }
 
+/* ---- a depth/stencil buffer's content for the CPU (M35) -------------------
+ *
+ * Depth and stencil live in the render's tiles, and in memory only as the
+ * ISP stores them (M24, res->zls): 32 x 32 pixels a tile, row by row, 4
+ * bytes a pixel -- F32 depth alone, or 24-bit depth with the stencil in the
+ * top byte -- tile (x, y) at (x + y * S) * 4 KiB, S two tiles for every 64
+ * pixels of the width.  A map of level 0 brings the resource's own linear
+ * copy, in its format, up to date from them (or from a clear no render has
+ * done yet); an unmap that wrote puts it back, for the next render to load. */
+static uint32_t *
+zls_texel(struct sgx_resource *res, unsigned x, unsigned y)
+{
+   unsigned s = 2 * DIV_ROUND_UP(res->base.width0, 64);
+
+   return (uint32_t *)((uint8_t *)res->zls->map + (x / 32 + y / 32 * s) * 4096) +
+          (y % 32) * 32 + x % 32;
+}
+
+static bool
+zs_to_linear(struct sgx_resource *res)
+{
+   struct pipe_resource *p = &res->base;
+   bool stencil = util_format_has_stencil(util_format_description(p->format));
+   bool depth = util_format_has_depth(util_format_description(p->format));
+   bool tiles = res->zls && res->zls_valid && sgx_bo_map(res->zls);
+   uint8_t *map = sgx_bo_map(res->bo);
+   float *z = MALLOC(p->width0 * sizeof(float));
+   uint8_t *st = MALLOC(p->width0);
+
+   if (!map || !z || !st) {
+      FREE(z);
+      FREE(st);
+      return false;
+   }
+   if (tiles)
+      sgx_bo_wait(res->zls, -1);
+   for (unsigned y = 0; y < p->height0; y++) {
+      uint8_t *row = map + res->offset[0] + y * res->stride[0];
+
+      for (unsigned x = 0; x < p->width0; x++) {
+         uint32_t w = tiles ? *zls_texel(res, x, y) : 0;
+
+         if (stencil) {
+            z[x] = (w & 0xffffff) / 16777215.0f;
+            st[x] = w >> 24;
+         } else {
+            memcpy(&z[x], &w, 4);
+            st[x] = 0;
+         }
+         if (res->zls_cleared)
+            z[x] = res->zls_clear;
+         else if (!tiles)
+            z[x] = 1.0f;
+      }
+      if (depth)
+         util_format_pack_z_float(p->format, row, z, p->width0);
+      if (stencil)
+         util_format_pack_s_8uint(p->format, row, st, p->width0);
+   }
+   FREE(z);
+   FREE(st);
+   return true;
+}
+
+static void
+linear_to_zs(struct sgx_screen *screen, struct sgx_resource *res)
+{
+   struct pipe_resource *p = &res->base;
+   bool stencil = util_format_has_stencil(util_format_description(p->format));
+   bool depth = util_format_has_depth(util_format_description(p->format));
+   uint8_t *map = sgx_bo_map(res->bo);
+   float *z = MALLOC(p->width0 * sizeof(float));
+   uint8_t *st = MALLOC(p->width0);
+
+   if (!res->zls) {
+      res->zls = sgx_bo_create(&screen->dev, sgx_frame_zls_size(p->width0, p->height0), 0, 0);
+      res->zls_valid = false;
+   }
+   if (map && z && st && res->zls && sgx_bo_map(res->zls)) {
+      sgx_bo_wait(res->zls, -1);
+      for (unsigned y = 0; y < p->height0; y++) {
+         const uint8_t *row = map + res->offset[0] + y * res->stride[0];
+
+         if (depth)
+            util_format_unpack_z_float(p->format, z, row, p->width0);
+         if (stencil)
+            util_format_unpack_s_8uint(p->format, st, row, p->width0);
+         for (unsigned x = 0; x < p->width0; x++) {
+            uint32_t w;
+
+            if (stencil) {
+               /* (in doubles: 1.0 in floats came to 2^24, a carry into the
+                * stencil) */
+               w = (uint32_t)st[x] << 24 |
+                   (depth ? (uint32_t)(CLAMP(z[x], 0.0f, 1.0f) * 16777215.0 + 0.5) : 0);
+            } else {
+               memcpy(&w, &z[x], 4);
+            }
+            *zls_texel(res, x, y) = w;
+         }
+      }
+      res->zls_valid = true;
+      res->zls_cleared = false;
+   }
+   FREE(z);
+   FREE(st);
+}
+
 static void *
 sgx_transfer_map(struct pipe_context *pctx, struct pipe_resource *prsc, unsigned level,
                  unsigned usage, const struct pipe_box *box, struct pipe_transfer **out)
@@ -452,6 +610,21 @@ sgx_transfer_map(struct pipe_context *pctx, struct pipe_resource *prsc, unsigned
       if (!sgx_bo_wait(res->bo, -1))
          return NULL;
    }
+   /* a depth clear at the start of a render that has no draws yet: the
+    * buffer's own from now on (what the CPU reads, or writes over) */
+   if (ctx->batch.zs_cleared && !ctx->batch.ndraws && ctx->fb.zsbuf.texture == prsc) {
+      res->zls_cleared = true;
+      res->zls_clear = ctx->batch.depth_clear;
+      ctx->batch.zs_cleared = false;
+   }
+   /* depth and stencil from the ISP's tiles, unless all of it is to be
+    * written */
+   if (util_format_is_depth_or_stencil(prsc->format) && prsc->target != PIPE_BUFFER &&
+       !level && !(usage & PIPE_MAP_DISCARD_WHOLE_RESOURCE) &&
+       !((usage & PIPE_MAP_DISCARD_RANGE) && box->width == (int)prsc->width0 &&
+         box->height == (int)prsc->height0) &&
+       !zs_to_linear(res))
+      return NULL;
    if (!(map = res->data ? res->data : sgx_bo_map(res->bo)))
       return NULL;
    /* (a map glthread makes in the application's thread: nothing of the
@@ -524,6 +697,9 @@ sgx_transfer_unmap(struct pipe_context *pctx, struct pipe_transfer *ptrans)
       res->seq++;
       if (ptrans->resource->target == PIPE_BUFFER && !(ptrans->usage & PIPE_MAP_FLUSH_EXPLICIT))
          buffer_written(res, ptrans->box.x, ptrans->box.x + ptrans->box.width, ptrans->usage);
+      if (util_format_is_depth_or_stencil(ptrans->resource->format) &&
+          ptrans->resource->target != PIPE_BUFFER && !ptrans->level)
+         linear_to_zs(sgx_screen(pctx->screen), res);
    }
    if (ptrans->resource->target == PIPE_BUFFER &&
        (ptrans->usage & (PIPE_MAP_THREAD_SAFE | PIPE_MAP_PERSISTENT)))

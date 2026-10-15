@@ -83,6 +83,7 @@ struct sgx_batch {
    unsigned nidx, maxidx;
    struct pipe_resource *tex[SGX_FRAME_MAX_HANDLES];   /* sampled, referenced */
    unsigned ntex;
+   uint64_t tex_bytes;                  /* the memory they hold (SGX_BATCH_TEX_BYTES) */
    /* the buffers the render lists for the kernel -- the textures' copies,
     * then buffers' (M26: their GPU copies, referenced in bos[], stamped
     * with seq) -- SGX_FRAME_MAX_HANDLES at most all told */
@@ -137,6 +138,9 @@ struct sgx_context {
    const struct pipe_sampler_state *fs_samplers[PIPE_MAX_SAMPLERS];
    struct pipe_sampler_view *fs_views[PIPE_MAX_SHADER_SAMPLER_VIEWS];
    struct sgx_fence *last;      /* the last render this context submitted */
+   /* a framebuffer of depth and stencil alone: the colour the tiles end in
+    * goes here (M35), the depth buffer's size */
+   struct pipe_resource *no_colour;
 
    /* draws (sgx_draw.c): the draw module, its back end, and the vertices
     * gathered for the template frame */

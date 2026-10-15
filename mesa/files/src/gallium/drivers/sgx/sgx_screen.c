@@ -29,6 +29,8 @@ static const struct nir_shader_compiler_options sgx_nir_options = {
    .no_integers = true,
    .scalarize_ddx = true,
    .lower_fdiv = true,
+   /* rectangle textures' coordinates scaled by load_texture_scale (M35) */
+   .has_texture_scaling = true,
    .lower_fmod = true,
    .lower_fpow = true,
    .lower_fsat = false,
@@ -103,6 +105,7 @@ sgx_is_format_supported(struct pipe_screen *pscreen, enum pipe_format format,
       return false;
    switch (target) {
    case PIPE_BUFFER:
+   case PIPE_TEXTURE_1D:      /* a 2D texture one texel high (lower_1d) */
    case PIPE_TEXTURE_2D:
    case PIPE_TEXTURE_RECT:
    case PIPE_TEXTURE_CUBE:
@@ -136,6 +139,14 @@ sgx_is_format_supported(struct pipe_screen *pscreen, enum pipe_format format,
       case PIPE_FORMAT_L8_UNORM:
       case PIPE_FORMAT_A8_UNORM:
       case PIPE_FORMAT_L8A8_UNORM:
+      /* sRGB (EXT_texture_sRGB, GL 2.1): the bytes as they are, decoded
+       * by the program (sgx_blend_key's tex_srgb) */
+      case PIPE_FORMAT_R8G8B8A8_SRGB:
+      case PIPE_FORMAT_B8G8R8A8_SRGB:
+      case PIPE_FORMAT_R8G8B8X8_SRGB:
+      case PIPE_FORMAT_B8G8R8X8_SRGB:
+      case PIPE_FORMAT_L8_SRGB:
+      case PIPE_FORMAT_L8A8_SRGB:
       /* depth (GLES 2 has OES_depth_texture whatever the driver says): its
        * copy grey, 8 bits of it (sgx_resource.c) */
       case PIPE_FORMAT_Z16_UNORM:
@@ -199,6 +210,9 @@ sgx_init_screen_caps(struct pipe_screen *pscreen)
    /* GLES 2.0: ARB_texture_non_power_of_two and EXT_blend_equation_separate
     * are what version.c asks for besides the shaders */
    caps->npot_textures = true;
+   /* rectangle textures as 2D ones, their coordinates scaled by the
+    * program (sgx_compiler.c, scale_sa) */
+   caps->texrect = false;
    caps->fragment_shader_derivatives = true;   /* DSX, DSY (M33) */
    caps->generate_mipmap = true;     /* by the CPU: sgx_resource.c */
    /* a buffer's map is its CPU copy, which the GPU's is brought up to date

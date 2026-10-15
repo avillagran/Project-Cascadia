@@ -59,10 +59,10 @@ else
 fi
 OPTS="--prefix=$PREFIX --libdir=lib $BT
     -Dc_args=-mtls-dialect=gnu -Dcpp_args=-mtls-dialect=gnu
-    -Dgallium-drivers=sgx -Dvulkan-drivers= -Dplatforms=wayland
-    -Dglx=disabled -Degl=enabled -Dgbm=enabled -Dgles1=disabled -Dgles2=enabled
+    -Dgallium-drivers=sgx,softpipe -Dvulkan-drivers= -Dplatforms=x11,wayland
+    -Dglx=dri -Degl=enabled -Dgbm=enabled -Dgles1=enabled -Dgles2=enabled
     -Dopengl=true -Dglvnd=disabled -Dllvm=disabled -Dvalgrind=disabled
-    -Dlibunwind=disabled -Dzstd=disabled -Dxmlconfig=disabled -Dexpat=disabled
+    -Dlibunwind=disabled -Dzstd=disabled -Dxmlconfig=enabled -Dexpat=enabled
     -Dshader-cache=disabled -Dtools= -Dbuild-tests=false -Dgallium-va=disabled
     -Dgallium-rusticl=false -Dvideo-codecs= -Dteflon=false -Dlmsensors=disabled
     -Dmicrosoft-clc=disabled -Dspirv-tools=disabled"
@@ -85,10 +85,13 @@ DESTDIR="$ID" ninja -C "$BD" install >/dev/null
 
 I=$ID$PREFIX
 mkdir -p "$I/bin"
-for t in glclear gltri glfs gltex glblend gldepth glspeed glpersp glsize glseam glcull gldiscard glstencil glchurn glwrap glvtx glmip glvary glldr glflow; do
+for t in glclear gltri glfs gltex glblend gldepth glspeed glpersp glsize glseam glcull gldiscard glstencil glchurn glwrap glvtx glmip glvary glldr glflow glfetch glflat; do
     cc -O2 -Wall -I"$I/include" "$ROOT/tools/sgx/gl/$t.c" -L"$I/lib" -lEGL -lGLESv2 -lm \
         -Wl,-rpath-link,"$I/lib" -Wl,-rpath,"$PREFIX/lib" -o "$I/bin/$t"
 done
+# desktop OpenGL (libGL) through EGL
+cc -O2 -Wall -I"$I/include" "$ROOT/tools/sgx/gl/gldesk.c" -L"$I/lib" -lEGL -lGL -lm \
+    -Wl,-rpath-link,"$I/lib" -Wl,-rpath,"$PREFIX/lib" -o "$I/bin/gldesk"
 # on the screen: GBM and KMS besides
 cc -O2 -Wall -I"$I/include" $(pkg-config --cflags libdrm) "$ROOT/tools/sgx/gl/glkms.c" \
     -L"$I/lib" -lEGL -lGLESv2 -lgbm $(pkg-config --libs libdrm) -lm \

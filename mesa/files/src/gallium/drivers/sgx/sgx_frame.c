@@ -187,6 +187,37 @@ pds_iterate(unsigned d, unsigned size)
    return 0x07000000u | ((d + 2) >> 2) << 18 | d << 10 | ((d + 1) & 3) << 8 | size;
 }
 #define ITER_TEMPS           6
+
+/* The PDS's texture lookups (M35; the 2026-10-10 corpus, s02 and s04): an
+ * iterate DOUT whose control word sends a varying's x and y to the
+ * texture unit -- no iterate into the registers (15:12 = 0xf), the
+ * varying in 3:0, 2D (10:8 = 1), the last lookup's bit 11 -- then a
+ * texture DOUT with the texture's four state words at data word s (even),
+ * the texel as it is (four bytes, one register) after the iterated inputs.
+ * The data word 1 of a program that has them: bit 3 (iOS: 0x0a, 0x0e with
+ * iterates besides). */
+#define FETCH_CONTROL_2D     0x0c00f100u   /* | varying, | FETCH_LAST */
+#define FETCH_LAST           0x800u
+#define FETCH_SIZE_RAW       0x02u
+#define PDS_FLAGS_FETCH      8u
+
+/* SGX_ITER_XOR=mask: bits flipped in every iterate's control word (finding
+ * what the rest of them do) */
+static uint32_t
+iter_xor(void)
+{
+   static int64_t x = -1;
+
+   if (x < 0)
+      x = getenv("SGX_ITER_XOR") ? strtoul(getenv("SGX_ITER_XOR"), NULL, 0) : 0;
+   return x;
+}
+
+static uint32_t
+pds_texture(unsigned s)
+{
+   return 0x07000000u | ((s + 2) >> 2) << 18 | s << 10 | 0x004;
+}
 /* the pack's colour, for draws through its vertex side */
 #define PACK_COLOUR_VARYING  1
 
@@ -465,14 +496,19 @@ sa_field(unsigned nsa)
 }
 
 /* State word 5 for a pixel program: the registers a pixel takes, primary
- * attributes and temporaries, in fours (bits 31:27); bits 26:23 as iOS has
+ * attributes and temporaries, in fours (bits 31:27) -- the temporaries
+ * from a four after the primary attributes (a texel the PDS fetched after
+ * the inputs, M35: one primary attribute and 27 temporaries counted as
+ * 28 registers, not 32, and the temporaries ran into the next pixel's
+ * texel, which read 0); bits 26:23 as iOS has
  * them for 2, 3 and 4 fours, 12 / fours (M13b), but 1 past 12 -- 0 there
  * and the program reads 0 for its inputs (M30); its secondary attributes
  * (sa_field) */
 static uint32_t
 pixel_word5(const struct sgx_pixel_program *pix)
 {
-   unsigned fours = DIV_ROUND_UP(4 * pix->ninputs + pix->ntemps, 4);
+   unsigned fours = DIV_ROUND_UP(4 * pix->ninputs + pix->nfetch, 4) +
+                    DIV_ROUND_UP(pix->ntemps, 4);
 
    return fours << 27 | (fours > 1 ? MAX2(12 / fours, 1) : 0) << 23 | sa_field(pix->nsa);
 }
@@ -1195,7 +1231,8 @@ sgx_frame_can_render(struct sgx_frame *f, const struct sgx_frame_target *t)
    struct sgx_eot to;
 
    if (!f || !t->res->bo || t->level > p->last_level || t->layer >= p->array_size ||
-       (p->target != PIPE_TEXTURE_2D && p->target != PIPE_TEXTURE_CUBE) ||
+       (p->target != PIPE_TEXTURE_2D && p->target != PIPE_TEXTURE_CUBE &&
+        p->target != PIPE_TEXTURE_RECT && p->target != PIPE_TEXTURE_1D) ||
        (p->format != PIPE_FORMAT_B8G8R8A8_UNORM && p->format != PIPE_FORMAT_B8G8R8X8_UNORM) ||
        p->nr_samples > 1)
       return false;
@@ -1667,8 +1704,8 @@ upload(struct sgx_frame *f, struct sgx_pixel_program *p)
    pds[n++] = (p->ninputs ? ITER_TEMPS : 2) | p->branches;
    pds[n++] = 0;
    for (unsigned i = 0; i < p->ninputs; i++)
-      pds[n++] = (i == p->ninputs - 1 ? ITERATE_F32_VEC4 : ITERATE_F32_VEC4_MORE) |
-                 p->iter_src[i] << 12;
+      pds[n++] = ((i == p->ninputs - 1 ? ITERATE_F32_VEC4 : ITERATE_F32_VEC4_MORE) |
+                  p->iter_src[i] << 12) ^ iter_xor();
    while (n % 4)
       pds[n++] = 0;
    data = n;
@@ -1942,8 +1979,9 @@ render(struct sgx_frame *f, struct sgx_resource *rt, const struct sgx_frame_layo
       /* our pixel program: its PDS (word 6), how many registers a pixel
        * takes (word 5) and its secondary attributes in sa0.. (word 4: a
        * DMA, then the empty program) */
-      /* (uniforms in memory only through draw_state(), M32) */
-      if (pix->nubuf)
+      /* (uniforms in memory and the PDS's lookups only through
+       * draw_state(), M32, M35) */
+      if (pix->nubuf || pix->nfetch)
          return -EINVAL;
       if ((ret = upload(f, pix)))
          return ret;
@@ -2111,6 +2149,54 @@ arena_uniforms(struct sgx_frame *f, const uint32_t *words, unsigned n, unsigned 
    return va + at;
 }
 
+/* A pixel program's PDS program with its texture lookups (M35), the
+ * draw's: its data -- the program to start, then the inputs' iterates'
+ * control words (as upload() has them), then each lookup's control word
+ * and the texture's state words (from the draw's sa words) -- and the
+ * DOUTs, into the render's memory.  Its address (*rows its data rows), 0
+ * if there is no room. */
+static uint32_t
+fetch_pds(struct sgx_frame *f, const struct sgx_pixel_program *p, const uint32_t *sa,
+          unsigned *rows)
+{
+   uint32_t pds[64], *dst, va;
+   unsigned n = 0, data, ctrl[SGX_FRAME_MAX_FETCH], state[SGX_FRAME_MAX_FETCH];
+
+   if (p->nfetch > SGX_FRAME_MAX_FETCH || p->ninputs > SGX_FRAME_MAX_VARYINGS)
+      return 0;
+   pds[n++] = doutu(f, p->code_va);
+   pds[n++] = (p->ninputs ? ITER_TEMPS : 2) | PDS_FLAGS_FETCH | p->branches;
+   pds[n++] = 0;
+   for (unsigned i = 0; i < p->ninputs; i++)
+      pds[n++] = ((i == p->ninputs - 1 ? ITERATE_F32_VEC4 : ITERATE_F32_VEC4_MORE) |
+                  p->iter_src[i] << 12) ^ iter_xor();
+   for (unsigned k = 0; k < p->nfetch; k++) {
+      ctrl[k] = n;
+      pds[n++] = FETCH_CONTROL_2D | (k == p->nfetch - 1 ? FETCH_LAST : 0) | p->fetch_src[k];
+      if (n & 1)
+         pds[n++] = 0;
+      state[k] = n;
+      memcpy(pds + n, sa + p->fetch_sa[k], 4 * sizeof(uint32_t));
+      n += 4;
+   }
+   while (n % 4)
+      pds[n++] = 0;
+   data = n;
+   pds[n++] = PDS_DOUTU_ROW0_ITER;
+   for (unsigned i = 0; i < p->ninputs; i++)
+      pds[n++] = pds_iterate(3 + i, 0x32);
+   for (unsigned k = 0; k < p->nfetch; k++) {
+      pds[n++] = pds_iterate(ctrl[k], FETCH_SIZE_RAW);
+      pds[n++] = pds_texture(state[k]);
+   }
+   pds[n++] = PDS_END;
+   if (!(dst = (uint32_t *)arena_alloc(f, n * 4, 16, &va)))
+      return 0;
+   memcpy(dst, pds, n * 4);
+   *rows = data / 4;
+   return va;
+}
+
 /* A draw's whole state for our vertex side, its secondary attributes'
  * loader and words into the render's memory */
 static int
@@ -2143,6 +2229,14 @@ draw_state(struct sgx_frame *f, const struct sgx_frame_draw *d, const struct sgx
       if (!pix->code_va || pix->nsa > 128)
          return -EINVAL;
       full[6] = pix->pds_rows << 27 | (pix->pds_va >> 4 & 0x07ffffff);
+      if (pix->nfetch) {
+         unsigned rows;
+         uint32_t pds = fetch_pds(f, pix, d->sa, &rows);
+
+         if (!pds)
+            return -ENOMEM;
+         full[6] = rows << 27 | (pds >> 4 & 0x07ffffff);
+      }
       full[5] = pixel_word5(pix);
       if (pix->nsa) {
          unsigned rows;

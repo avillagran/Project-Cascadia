@@ -1,0 +1,330 @@
+/* gldesk -- desktop OpenGL (2.1, compatibility) through the driver
+ * (docs/research/p105-mesa.md, M35, M36): a 1D texture, sRGB textures (RGBA
+ * and luminance, decoded or not), a rectangle texture (unnormalized
+ * coordinates), the fixed-function pipeline (glBegin and client arrays, a
+ * texture modulated by the vertex colour).  A 64 x 64 target, every pixel
+ * read back against what C works out.
+ *
+ *   sgx-gl gldesk [CASE]        (CASE: a name's start; all by default)
+ */
+#include <EGL/egl.h>
+#include <EGL/eglext.h>
+#define GL_GLEXT_PROTOTYPES
+#include <GL/gl.h>
+#include <GL/glext.h>
+
+#include <math.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define W 64
+#define H 64
+
+static uint8_t px[W * H * 4];
+static int cases, failed;
+static const char *only;
+
+static const char *vs =
+	"#version 120\n"
+	"attribute vec4 a_position;\n"
+	"varying vec2 v;\n"
+	"void main() { gl_Position = a_position; v = a_position.xy * 0.5 + 0.5; }\n";
+
+static GLuint
+program(const char *fs_body)
+{
+	char fs[2048], log[512];
+	const char *src[2] = { vs, fs };
+	GLuint p = glCreateProgram();
+	GLint ok;
+
+	snprintf(fs, sizeof(fs), "#version 120\n#extension GL_ARB_texture_rectangle : enable\n"
+	         "varying vec2 v;\nuniform sampler1D t1;\nuniform sampler2D t2;\n"
+	         "uniform sampler2DRect tr;\nvoid main() { %s }\n", fs_body);
+	for (int i = 0; i < 2; i++) {
+		GLuint s = glCreateShader(i ? GL_FRAGMENT_SHADER : GL_VERTEX_SHADER);
+
+		glShaderSource(s, 1, &src[i], NULL);
+		glCompileShader(s);
+		glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
+		if (!ok) {
+			glGetShaderInfoLog(s, sizeof(log), NULL, log);
+			fprintf(stderr, "gldesk: %s\n", log);
+		}
+		glAttachShader(p, s);
+	}
+	glBindAttribLocation(p, 0, "a_position");
+	glLinkProgram(p);
+	glUseProgram(p);
+	glUniform1i(glGetUniformLocation(p, "t1"), 0);
+	glUniform1i(glGetUniformLocation(p, "t2"), 1);
+	glUniform1i(glGetUniformLocation(p, "tr"), 2);
+	return p;
+}
+
+static int
+to8(float x)
+{
+	return (int)(fminf(fmaxf(x, 0), 1) * 255 + 0.5f);
+}
+
+static float
+srgb_to_linear(float c)
+{
+	return c <= 0.04045f ? c / 12.92f : powf((c + 0.055f) / 1.055f, 2.4f);
+}
+
+static int
+want_ok(void (*want)(float s, float t, float rgba[4]), int tolerance, const char *name)
+{
+	int bad = 0, at = -1;
+	float rgba[4];
+
+	glReadPixels(0, 0, W, H, GL_RGBA, GL_UNSIGNED_BYTE, px);
+	for (int i = 0; i < W * H; i++) {
+		int off = 0;
+
+		want((i % W + 0.5f) / W, (i / W + 0.5f) / H, rgba);
+		for (int c = 0; c < 4; c++)
+			off |= abs(px[4 * i + c] - to8(rgba[c])) > tolerance;
+		if (off && at < 0)
+			at = i;
+		bad += off;
+	}
+	cases++;
+	if (!bad) {
+		printf("%-36s ok\n", name);
+		return 1;
+	}
+	failed++;
+	want((at % W + 0.5f) / W, (at / W + 0.5f) / H, rgba);
+	printf("%-36s WRONG: %d pixels, the first at %d, %d: %d %d %d %d, want %d %d %d %d\n", name,
+	       bad, at % W, at / W, px[4 * at], px[4 * at + 1], px[4 * at + 2], px[4 * at + 3],
+	       to8(rgba[0]), to8(rgba[1]), to8(rgba[2]), to8(rgba[3]));
+	return 0;
+}
+
+static void
+check(const char *name, const char *body, void (*want)(float s, float t, float rgba[4]))
+{
+	static const float quad[] = { -1, -1, 1, -1, -1, 1, 1, 1 };
+	GLuint p;
+
+	if (only && strncmp(name, only, strlen(only)))
+		return;
+	p = program(body);
+	glEnableVertexAttribArray(0);
+	glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, quad);
+	glClearColor(0, 0, 0, 0);
+	glClear(GL_COLOR_BUFFER_BIT);
+	glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+	glDisableVertexAttribArray(0);
+	glUseProgram(0);
+	glDeleteProgram(p);
+	want_ok(want, 2, name);
+}
+
+/* the 1D texture: 8 texels */
+static const uint8_t tex1d[8][4] = {
+	{ 255, 0, 0, 255 }, { 0, 255, 0, 255 }, { 0, 0, 255, 255 }, { 255, 255, 0, 255 },
+	{ 0, 255, 255, 200 }, { 255, 0, 255, 150 }, { 128, 128, 128, 100 }, { 10, 20, 30, 40 },
+};
+
+static void
+want_1d(float s, float t, float c[4])
+{
+	(void)t;
+	for (int k = 0; k < 4; k++)
+		c[k] = tex1d[(int)(s * 8)][k] / 255.0f;
+}
+
+/* the sRGB textures: 4 x 4, texel i's bytes */
+static void
+srgb_bytes(int i, uint8_t c[4])
+{
+	c[0] = i * 17, c[1] = 255 - i * 13, c[2] = 32 + i * 9, c[3] = 64 + i * 8;
+}
+
+static void
+want_srgb(float s, float t, float c[4])
+{
+	uint8_t b[4];
+
+	srgb_bytes((int)(s * 4) + 4 * (int)(t * 4), b);
+	for (int k = 0; k < 3; k++)
+		c[k] = srgb_to_linear(b[k] / 255.0f);
+	c[3] = b[3] / 255.0f;
+}
+
+static void
+want_srgb_raw(float s, float t, float c[4])
+{
+	uint8_t b[4];
+
+	srgb_bytes((int)(s * 4) + 4 * (int)(t * 4), b);
+	for (int k = 0; k < 4; k++)
+		c[k] = b[k] / 255.0f;
+}
+
+/* the rectangle texture: 6 x 3, texel (x, y) bytes x * 40, y * 80, 200 */
+static void
+want_rect(float s, float t, float c[4])
+{
+	int x = (int)(s * 6), y = (int)(t * 3);
+
+	c[0] = x * 40 / 255.0f, c[1] = y * 80 / 255.0f, c[2] = 200 / 255.0f, c[3] = 1;
+}
+
+static void
+want_sluminance(float s, float t, float c[4])
+{
+	uint8_t b[4];
+
+	srgb_bytes((int)(s * 4) + 4 * (int)(t * 4), b);
+	c[0] = c[1] = c[2] = srgb_to_linear(b[0] / 255.0f);
+	c[3] = 1;
+}
+
+/* the fixed-function quad: a vertex colour (red to the right, green up,
+ * blue and alpha 1) times the sRGB texture's bytes as RGBA8 */
+static void
+want_ff(float s, float t, float c[4])
+{
+	uint8_t b[4];
+
+	srgb_bytes((int)(s * 4) + 4 * (int)(t * 4), b);
+	c[0] = b[0] / 255.0f * s;
+	c[1] = b[1] / 255.0f * t;
+	c[2] = b[2] / 255.0f;
+	c[3] = b[3] / 255.0f;
+}
+
+int
+main(int argc, char **argv)
+{
+	PFNEGLGETPLATFORMDISPLAYEXTPROC get_display;
+	EGLint ctx_attrs[] = { EGL_CONTEXT_MAJOR_VERSION, 2, EGL_CONTEXT_MINOR_VERSION, 1, EGL_NONE };
+	GLuint rt, fbo, t1, t2, t3;
+	uint8_t img[16][4], lum[16];
+	EGLDisplay dpy;
+	EGLContext ctx;
+
+	only = argc > 1 ? argv[1] : NULL;
+	get_display = (PFNEGLGETPLATFORMDISPLAYEXTPROC)eglGetProcAddress("eglGetPlatformDisplayEXT");
+	dpy = get_display ? get_display(EGL_PLATFORM_SURFACELESS_MESA, EGL_DEFAULT_DISPLAY, NULL) : NULL;
+	if (!dpy || !eglInitialize(dpy, NULL, NULL) || !eglBindAPI(EGL_OPENGL_API))
+		return fprintf(stderr, "gldesk: no EGL\n"), 2;
+	ctx = eglCreateContext(dpy, EGL_NO_CONFIG_KHR, EGL_NO_CONTEXT, ctx_attrs);
+	if (ctx == EGL_NO_CONTEXT || !eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, ctx))
+		return fprintf(stderr, "gldesk: no OpenGL 2.1 context\n"), 2;
+	printf("%s, %s\n", glGetString(GL_VERSION), glGetString(GL_RENDERER));
+	glGenTextures(1, &rt);
+	glBindTexture(GL_TEXTURE_2D, rt);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, W, H, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+	glGenFramebuffers(1, &fbo);
+	glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, rt, 0);
+	if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
+		return fprintf(stderr, "gldesk: the target is not complete\n"), 2;
+	glViewport(0, 0, W, H);
+
+	glActiveTexture(GL_TEXTURE0);
+	glGenTextures(1, &t1);
+	glBindTexture(GL_TEXTURE_1D, t1);
+	glTexImage1D(GL_TEXTURE_1D, 0, GL_RGBA8, 8, 0, GL_RGBA, GL_UNSIGNED_BYTE, tex1d);
+	glTexParameteri(GL_TEXTURE_1D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_1D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+
+	for (int i = 0; i < 16; i++) {
+		srgb_bytes(i, img[i]);
+		lum[i] = img[i][0];
+	}
+	glActiveTexture(GL_TEXTURE1);
+	glGenTextures(1, &t2);
+	glBindTexture(GL_TEXTURE_2D, t2);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_SRGB8_ALPHA8, 4, 4, 0, GL_RGBA, GL_UNSIGNED_BYTE, img);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+
+	check("a 1D texture", "gl_FragColor = texture1D(t1, v.x);", want_1d);
+	check("an sRGB texture", "gl_FragColor = texture2D(t2, v);", want_srgb);
+	if (strstr((const char *)glGetString(GL_EXTENSIONS), "GL_EXT_texture_sRGB_decode")) {
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SRGB_DECODE_EXT, GL_SKIP_DECODE_EXT);
+		check("an sRGB texture, not decoded", "gl_FragColor = texture2D(t2, v);", want_srgb_raw);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SRGB_DECODE_EXT, GL_DECODE_EXT);
+	}
+	glGenTextures(1, &t3);
+	glBindTexture(GL_TEXTURE_2D, t3);
+	glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_SLUMINANCE8, 4, 4, 0, GL_LUMINANCE, GL_UNSIGNED_BYTE, lum);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+	check("an sRGB luminance texture", "gl_FragColor = texture2D(t2, v);", want_sluminance);
+
+	/* a rectangle texture: unnormalized coordinates */
+	{
+		uint8_t rect[3][6][4];
+		GLuint tr;
+
+		for (int y = 0; y < 3; y++)
+			for (int x = 0; x < 6; x++) {
+				rect[y][x][0] = x * 40, rect[y][x][1] = y * 80;
+				rect[y][x][2] = 200, rect[y][x][3] = 255;
+			}
+		glActiveTexture(GL_TEXTURE2);
+		glGenTextures(1, &tr);
+		glBindTexture(GL_TEXTURE_RECTANGLE, tr);
+		glTexImage2D(GL_TEXTURE_RECTANGLE, 0, GL_RGBA8, 6, 3, 0, GL_RGBA, GL_UNSIGNED_BYTE, rect);
+		glTexParameteri(GL_TEXTURE_RECTANGLE, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+		glTexParameteri(GL_TEXTURE_RECTANGLE, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+		check("a rectangle texture", "gl_FragColor = texture2DRect(tr, v * vec2(6.0, 3.0));",
+		      want_rect);
+		glActiveTexture(GL_TEXTURE1);
+	}
+
+	/* the fixed-function pipeline: glBegin, the texture (as RGBA8)
+	 * modulated by the vertex colour */
+	if (!only || !strncmp("fixed", only, strlen(only))) {
+		glActiveTexture(GL_TEXTURE0);   /* glTexCoord's unit */
+		glBindTexture(GL_TEXTURE_2D, t2);
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 4, 4, 0, GL_RGBA, GL_UNSIGNED_BYTE, img);
+		glEnable(GL_TEXTURE_2D);
+		glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
+		glClear(GL_COLOR_BUFFER_BIT);
+		glBegin(GL_QUADS);
+		glColor4f(0, 0, 1, 1); glTexCoord2f(0, 0); glVertex2f(-1, -1);
+		glColor4f(1, 0, 1, 1); glTexCoord2f(1, 0); glVertex2f(1, -1);
+		glColor4f(1, 1, 1, 1); glTexCoord2f(1, 1); glVertex2f(1, 1);
+		glColor4f(0, 1, 1, 1); glTexCoord2f(0, 1); glVertex2f(-1, 1);
+		glEnd();
+		want_ok(want_ff, 3, "fixed function, a texture modulated");
+
+		/* the same from client arrays */
+		{
+			static const float pos[] = { -1, -1, 1, -1, -1, 1, 1, 1 };
+			static const float tc[] = { 0, 0, 1, 0, 0, 1, 1, 1 };
+			static const float col[] = { 0, 0, 1, 1, 1, 0, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1 };
+
+			glClear(GL_COLOR_BUFFER_BIT);
+			glEnableClientState(GL_VERTEX_ARRAY);
+			glEnableClientState(GL_COLOR_ARRAY);
+			glEnableClientState(GL_TEXTURE_COORD_ARRAY);
+			glVertexPointer(2, GL_FLOAT, 0, pos);
+			glColorPointer(4, GL_FLOAT, 0, col);
+			glTexCoordPointer(2, GL_FLOAT, 0, tc);
+			glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+			glDisableClientState(GL_VERTEX_ARRAY);
+			glDisableClientState(GL_COLOR_ARRAY);
+			glDisableClientState(GL_TEXTURE_COORD_ARRAY);
+			want_ok(want_ff, 3, "fixed function, from arrays");
+		}
+		glDisable(GL_TEXTURE_2D);
+	}
+
+	printf("%d of %d cases right\n", cases - failed, cases);
+	eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+	eglTerminate(dpy);
+	return failed ? 1 : 0;
+}

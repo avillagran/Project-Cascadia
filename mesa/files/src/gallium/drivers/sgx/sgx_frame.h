@@ -77,6 +77,8 @@ int sgx_frame_clear(struct sgx_frame *f, struct sgx_resource *rt, const float rg
 /* the iterate source of the pixel's position, window coordinates in F32
  * (iOS's gl_FragCoord: corpus v08, control word 0x0fc0d00f) */
 #define SGX_ITERATE_POSITION 13
+/* texture lookups the PDS makes for a pixel program (M35) */
+#define SGX_FRAME_MAX_FETCH 4
 
 struct sgx_frame_layout {
    unsigned nvaryings;
@@ -113,6 +115,14 @@ struct sgx_pixel_program {
    /* uniform words in memory after the nsa (M32): the draw's words go on
     * with them, and sa word ubuf_sa has their address less 4 */
    unsigned nubuf, ubuf_sa;
+   /* lookups the PDS makes before the program runs (M35): texture k's
+    * texel, as it is (four bytes), into the primary attribute after the
+    * inputs' (pa4 ninputs + k), the coordinates varying fetch_src[k]'s x
+    * and y, the texture's four state words sa words fetch_sa[k].. (the
+    * draw's) -- the PDS program then the draw's own */
+   unsigned nfetch;
+   uint8_t fetch_src[SGX_FRAME_MAX_FETCH];
+   uint8_t fetch_sa[SGX_FRAME_MAX_FETCH];
    uint32_t code_va, pds_va;
    unsigned pds_rows;
    bool branches;               /* its pixels each on its own: the code branches, not

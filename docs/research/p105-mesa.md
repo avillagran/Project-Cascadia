@@ -2381,6 +2381,202 @@ waits for the GPU: both sides), 8 blended layers 53 -> 34.8 ms; SuperTux
 24.5 -> 26 fps, the GPU 24.7 ms of its frame. dEQP-GLES2 the same,
 16 859 / 91, no render timed out.
 
+## M35: texture lookups by the PDS; the system's OpenGL
+
+**The PDS's lookups.** iOS draws SDL's textured sprite with three
+instructions (`mul.f16 pa0, pa2, pa0; pck.u8.f16; sop2`): the texel is
+in the primary attributes before the program starts, fetched by the PDS
+program, not by an SMP in it. The 2026-10-10 corpus (`s00`..`s11`, and
+`t05`, `t09` of the older one) shows how:
+
+- An iterate DOUT's control word has two halves. The upper one is what
+  M11 found, an iterate into the registers: format in bits 29:28 (0 F32,
+  1 U8, 2 F16), bit 25 the last such, bits 23:22 components - 1, bits
+  15:12 the varying (15: none). The lower one sends a varying to the
+  texture unit for the texture DOUT that follows: bits 3:0 the varying
+  (15: none) whose x, y (and z) are the coordinates, bits 10:8 the kind
+  (1 2D, 2 projective, 3 a cube map), bit 11 the last lookup. SDL's sprite
+  is one control word, `2fc01900`: the colour as F16 into the registers
+  and varying 0 to the texture unit.
+- The texture DOUT (`07041004`: kind 004, its four state words from data
+  word (17:10), (s + 2) >> 2 in 23:18) hands back the texel as it is, one
+  register; kind 024 with bit 31 of state word 3 set, as F16, two.
+- The iterated values go first, then the texel (`t05`: the coordinates
+  in pa0, the texel in pa1). A bias is the state's (word 0's bias
+  field: `03fe0090` -> `057e0090` for 1.5); a lookup at `.zw`, or at
+  coordinates the program works out, is an SMP in the program.
+- Data word 1 of a program with lookups has bit 3 set (iOS's `0x0a`;
+  `0x0e` with iterates too, bit 2).
+
+The compiler (`plan_inputs()`) now hands every 2D lookup at a varying's x
+and y -- implicit level of detail, no bias, four at most -- to the PDS:
+its texel is in pa(4 * inputs + k), unpacked as an SMP's was. A varying
+only lookups read is not iterated into the registers at all (it stays in
+the layout: `sgx_fs.varying_slot[]`). The PDS program is the draw's now
+(`fetch_pds()`, in the render's memory): the texture's state words are in
+its data, after the iterates' control words, iOS's order -- the iterates,
+then for each lookup its control word and the texture DOUT. The TAG takes
+the level of detail from the iterated coordinates of the 2x2 block, so a
+lookup in a branch that pixels take apart needs no level 0 any more, and a
+program whose only lookups are the PDS's keeps skipinv (iOS's t00).
+
+One thing broke on the way: state word 5's registers a pixel takes, in
+fours, counted the texels with the temporaries -- one texel and 27
+temporaries made 28 registers, and the temporaries start at a four after
+the primary attributes: the last ones ran into the next pixel's texel,
+which read 0 (glflow's lookup in a loop, as soon as the loop's
+temporaries reached r24). The primary attributes are rounded up to a four
+now.
+
+`tools/sgx/gl/glfetch.c`: one texture, times a colour, the coordinates
+read besides, two, four, a fifth in the program, one texture twice,
+beside a dependent lookup, at `.zw`, with `gl_FragCoord`, in an if/else
+on a varying, in a loop, a mipmap's level -- 14 of 14, the same with
+`SGX_NOFETCH=1` (in the program). SDL's program 10 -> 8 instructions;
+SuperTux's GPU time 23.9 -> 21.1 ms a frame, `glspeed` textured layers
+33.4 -> 29.0 ms (debug builds). dEQP-GLES2 the same 16 859 / 91, the same
+cases, no render timed out. `corpus.py --pds` finds PDS programs by their
+shape now (this corpus's code base is not 64 KiB-aligned, and the DOUTU
+search found nothing) and names both halves of a control word.
+
+**The system's OpenGL.** Mesa is built as a whole OpenGL now -- the X11
+and Wayland platforms, GLX (`libGL`), GLES 1 and 2, EGL, GBM, softpipe (the
+software rasteriser, for comparison: `LIBGL_ALWAYS_SOFTWARE=1
+GALLIUM_DRIVER=softpipe`) and driconf -- and `mesa/install.py` makes it the
+system's: `/etc/ld-musl-armhf.path` puts `/usr/local/lib/sgx-mesa/lib`
+ahead of `/usr/lib`, so every program loads it, Alpine's Mesa left in
+place (the file taken away, it is back). No `sgx-gl`, no preloading:
+`eglinfo` says OpenGL 2.1 on the PowerVR SGX543MP2, and SuperTux's GLEW
+finds the right libGL.
+
+**OpenGL 2.1.** Mesa said 2.0 for want of EXT_texture_sRGB. sRGB textures
+are kept as their bytes and decoded by the program after the lookup
+(`nir_lower_tex`'s `lower_srgb`, a bit a unit in the variant key): no
+gamma bit of the sampler's turned up (word 0's bits 0..2, 14..16 and
+27..31 flipped, the sampler's output raw and F32), and iOS on the A5 has
+no sRGB to capture. Decoded after filtering rather than before -- exact
+for nearest sampling. 1D textures are 2D ones a texel high
+(`lower_1d`), rectangle and 1D textures render targets like 2D ones.
+`tools/sgx/gl/gldesk.c` (desktop GL through EGL): a 1D texture, sRGB RGBA
+and luminance textures, decoded and not (EXT_texture_sRGB_decode), the
+fixed-function pipeline from glBegin and from client arrays -- 6 of 6.
+
+**piglit.** The OpenGL test suite: `tools/piglit/build.sh` builds it in
+an Alpine armv7 image (`tools/piglit/Dockerfile`; 1831 programs),
+`tools/piglit/run.sh` runs its `quick_gl` profile on the iPad without what
+an OpenGL 2.1 part can never have (GLSL 1.30 on, GL 3 and 4 and their
+extensions): 4691 tests, about 40 minutes. Through GBM (waffle's
+surfaceless platform aborts). The first run stopped a sixth of the way: the
+OOM killer took the runner while `streaming-texture-leak` made, drew with
+and deleted 5000 textures of 4 MiB in one render -- all of them referenced
+until it was made, in kernel pages no process is charged with. A render
+that holds more than 48 MiB of textures goes first now
+(`SGX_BATCH_TEX_BYTES`); the test passes alone in 25 minutes (each upload
+converted and twiddled by the CPU) and `run.sh` leaves it out. The first
+whole run (debug build): **722 pass, 233 fail, 8 crash**, 3727 skip -- M36
+is what it found.
+
+## M36: what piglit found first
+
+Read case by case from the first run, debug and release builds side by
+side; `LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=softpipe` tells a test's
+own mistake from ours (gldesk's fixed-function case drew unit 1's texture
+from unit 0's coordinates on both). gdb is on the iPad now (Alpine's armhf
+packages, as binutils were).
+
+- **Depth and stencil for the CPU.** glReadPixels, glDrawPixels and
+  glCopyPixels of depth or stencil, depth textures read back and blits of
+  depth went through maps of the depth buffer, whose linear copy nothing
+  ever wrote: depth lives in the ISP's tiles (M24). A map of level 0 now
+  turns the stored tiles -- 32 x 32, F32 or 24-bit depth with stencil in
+  the top byte, M24's layout -- into the resource's format
+  (`zs_to_linear()`), or the clear a render has not done yet; an unmap that
+  wrote turns it back into tiles for the next render to load
+  (`linear_to_zs()`). A depth clear at the start of a render with no draws
+  is handed to the buffer when it is mapped. The CPU's blit does depth and
+  stencil too. One bug on the way: depth 1.0 to 24 bits in floats is
+  16777215.5, which rounds to 2^24 -- a carry into the stencil byte (in
+  doubles now).
+- **Depth alone.** A framebuffer with no colour buffer -- a shadow map's
+  -- was dropped ("draws only go into B8G8R8A8 targets"), and its clears
+  dereferenced the missing colour buffer: the render's tiles now end in a
+  colour target of the depth buffer's size that nothing reads
+  (`ctx->no_colour`). A program that writes no colour is `NOP` with the end
+  bit (o0 keeps the tile's colour), as a colour mask of nothing was.
+- **Texture levels and LOD.** GL's base and maximum levels and its minimum
+  and maximum LOD were ignored. The sampler's own are the copy's level 0
+  and word 0's last level, so the copy starts at the base level -- or m
+  levels further for a minimum LOD m: the sampler's LOD, from that level's
+  size, is then GL's less m, max(lambda, m) in all -- and the last level is
+  the maximum level's or LOD's (`sampled_levels()`; exact for whole
+  numbers; a texture's copy is made again when the base moves). The
+  sampler's LOD bias is word 0's bits 26:21, 31 + eighths (iOS's t03 and
+  s06: 39 for 1.0, 43 for 1.5). levelclamp, lodclamp, mipmap-setup,
+  texture-base-level pass.
+- **Rectangle textures** were refused by the compiler. With
+  `caps.texrect` off the state tracker scales their coordinates by
+  `load_texture_scale` (`has_texture_scaling`) and leaves the sampler's
+  dimension Rect: the compiler samples them as 2D, and two words a texture
+  after the samplers' state words hold 1 / width, 1 / height (`scale_sa`,
+  the draw's). (`nir_lower_tex`'s own `lower_rect` on top scaled them
+  twice.) gldesk has a 6 x 3 one.
+- **Values made where they are used.** piglit's varying-packing vertex
+  shaders store 32 sums of a uniform: NIR made all 32 first and stored them
+  after, and a value is a register pair here -- more than the temporaries
+  hold, run on the CPU. `nir_opt_move` now puts constants, uniforms,
+  inputs, comparisons and single-source ALU operations just before their
+  first use. (`nir_schedule`'s least-pressure order made the fragment
+  shader worse: 32 comparisons first, then the chain that reads them.) The
+  tests still fail: they compare a varying that is the same at every vertex
+  with `!=`, and the TSP's plane is not exact unless the triangle's size is
+  a power of two (M31) -- flat interpolation would make it exact.
+- `SGX_DEBUG_NIR=1` prints the shader as the compiler takes it;
+  `SGX_ITER_XOR=mask` flips bits of every iterate's control word.
+
+The second whole run (release build, before the last three fixes): **774
+pass, 187 fail, 1 crash**, 1 timeout -- 56 fixed, 4 broken (the carry
+above), fixed since. A debug build crashes on Mesa's own assertions where a
+release build goes on (`nir_lower_passthrough_edgeflags`, softpipe too;
+`maxLevels != 0` for a 3D proxy texture): the system's build should be the
+release one.
+
+**What the rest needs** -- most of it the hardware's, not found by flipping
+bits:
+
+- **Flat shading** (glShadeModel, provoking vertex, GLSL's `flat`):
+  neither a single bit of state words 0..3 and 16..20 nor of the iterate's
+  control word makes a triangle one vertex's colour (`tools/sgx/gl/glflat.c`
+  probes it: two triangles, each vertex its own colour, `SGX_STATE`); bits
+  17 and 18 of the control word make x and y 1.0, 28..30 the format, 25 the
+  last. Also what would make the varying-packing cases exact.
+- **Discard with depth** (punch-through, M19) and **gl_FragDepth**: iOS's
+  program is known, the render's setting is not -- in the render command,
+  which the corpus did not record.
+- **Logic ops, the alpha test, user clip planes, point sprites, polygon
+  offset, two-sided colour, occlusion queries.** OpenGL ES 1 has the first
+  five (and ES 2's extensions the last ones): iOS's driver shows how.
+- **Border colours** (GL_CLAMP_TO_BORDER), **3D textures**, **shadow
+  compare** and depth texture modes, line stipple and smooth lines, the
+  front buffer and swap behaviour on GBM, logic ops' xor cursors.
+
+**For the next capture** (`tools/shadercap.sh`, the same command): gltrace
+records each case's render commands now (header, the 55-word payload, the
+records -- what the kext builds the 3D registers from, `rtemu.py`), lists
+the extensions, and takes new directives -- `// texfmt:` (565, 4444, 5551,
+RGB8, L8, A8, LA8, half and float, BGRA, sRGB, depth 16 and 32, depth and
+stencil), `// compare`, `// maxlevel:`, `// aniso:`, `// wrap:`, `// rt:`
+(565, 4444, 5551, RGBA8, half-float targets), `// query: occlusion`, `//
+offset: F U`. The cases `m00`..`m31`: opaque, discarding with and without
+depth, blended (their render commands side by side), depth textures,
+`shadow2DEXT`, `gl_FragDepthEXT`, a texture of each format, a maximum
+level, anisotropy, the wrap modes, a target of each format, an occlusion
+query, polygon offset, `texture2DLodEXT`. And **`gltrace es1`**: OpenGL ES
+1's fixed function on the same driver, 25 cases -- smooth and flat (with a
+texture, and lines), every kind of logic op, the alpha test (with depth),
+a clip plane, point sprites and point sizes, linear fog, smooth lines,
+polygon offset, two-sided lighting, texture env ADD, plain points and
+lines; shadercap runs it after the corpus, into `es1/`.
+
 ## Testing, without and with the device
 
 - **Host, every change:** the kernel driver builds with `W=1` against the

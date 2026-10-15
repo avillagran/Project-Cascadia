@@ -42,6 +42,7 @@ struct sgx_resource {
    uint32_t tw_seq;                               /* the content it was made from */
    unsigned tw_w, tw_h;                           /* its size (linear: the stride's) */
    unsigned tw_levels;                            /* its levels (of each face, M28) */
+   unsigned tw_first;                             /* the level its level 0 is (M35) */
    struct sgx_bo *sampled;                        /* what the last state words point at */
    bool external;                                 /* shared: others may write it */
    bool gpu_written;                              /* a render has written it */
@@ -68,11 +69,17 @@ struct sgx_transfer {
  * shader swaps red and blue back, *x8 that it takes alpha as 1. */
 bool sgx_resource_linear(const struct sgx_resource *res, bool *swap, bool *x8);
 
-/* The four state words the sampler reads for res sampled with ss (M14):
- * the twiddled copy brought up to date first.  False when res cannot be
- * sampled yet (not 2D, no copy). */
+/* The four state words the sampler reads for res sampled through view
+ * with ss (M14): the twiddled copy brought up to date first.  False when
+ * res cannot be sampled yet (not 2D, no copy). */
 bool sgx_resource_texture(struct sgx_screen *screen, struct sgx_resource *res,
+                          const struct pipe_sampler_view *view,
                           const struct pipe_sampler_state *ss, uint32_t words[4]);
+
+/* Whether sampling res so would make its twiddled copy again (the renders
+ * gathered read the old one) */
+bool sgx_resource_copy_stale(const struct sgx_resource *res, const struct pipe_sampler_view *view,
+                             const struct pipe_sampler_state *ss);
 
 /* A buffer's copy for the GPU (M26), brought up to date with the CPU's
  * first: written in place when no render reads it -- gathered or running

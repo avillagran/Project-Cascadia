@@ -24,14 +24,16 @@ struct nir_shader;
  * render target 0, as the shader does it (M14): equations and factors
  * (pipe_blend_func, pipe_blendfactor), the colour mask.  And the texture
  * units sampled linear (sgx_resource_linear(), M16) from memory in R G B A
- * order (red and blue swapped back), and with no alpha.  All zero but
- * colormask 0xf: nothing done. */
+ * order (red and blue swapped back), and with no alpha; those whose texels
+ * are sRGB, decoded after the lookup (GL 2.1's EXT_texture_sRGB: no gamma
+ * of the sampler's found, M35).  All zero but colormask 0xf: nothing
+ * done. */
 struct sgx_blend_key {
    uint8_t enable;
    uint8_t rgb_func, rgb_src, rgb_dst;
    uint8_t alpha_func, alpha_src, alpha_dst;
    uint8_t colormask;
-   uint8_t tex_swap, tex_x8;
+   uint8_t tex_swap, tex_x8, tex_srgb;
    uint8_t front_ccw;      /* gallium's, for gl_FrontFacing (0 when not read) */
 };
 
@@ -40,13 +42,20 @@ struct sgx_blend_key {
 /* A compiled fragment shader.  Its secondary attributes (prog.nsa words)
  * are constant buffer 0's words 0..nuniforms, then from sampler_sa four
  * state words for each texture it samples, sampler_unit[i] the unit of the
- * i-th, then (blend_sa, if the blending reads it) the blend colour. */
+ * i-th, then (scale_sa) two words for each, 1 / its width and height, if a
+ * rectangle texture is sampled (M35), then (blend_sa, if the blending reads
+ * it) the blend colour. */
 struct sgx_fs {
    struct sgx_pixel_program prog;
    unsigned input_slot[SGX_FRAME_MAX_VARYINGS];   /* gl_varying_slot, input i */
+   /* the varyings the vertex side hands over, in the layout's order
+    * (prog.nvaryings): the inputs' but gl_FragCoord, then those only the
+    * PDS's lookups read (M35) */
+   unsigned varying_slot[SGX_FRAME_MAX_VARYINGS];
    unsigned nuniforms, nsamplers, sampler_sa;
    unsigned sampler_unit[SGX_FS_MAX_SAMPLERS];
    int blend_sa;                                  /* -1: no blend colour */
+   int scale_sa;              /* -1, or each texture's 1 / width, 1 / height (rectangles) */
    struct sgx_blend_key blend;                    /* what it was compiled for */
 };
 

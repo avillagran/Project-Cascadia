@@ -2,7 +2,10 @@
 
 A Gallium driver for the iPad mini's GPU, built into Mesa 26.1.8 for the
 device. The plan and the state of it: [docs/research/p105-mesa.md](../docs/research/p105-mesa.md)
-(M12 on). It runs OpenGL ES 2.0 programs: clears on the GPU (`sgx-gl
+(M12 on). It is the system's OpenGL once installed -- OpenGL ES 1 and 2,
+desktop OpenGL 2.1 through GLX and EGL (M35), dEQP-GLES2 16 859 / 91 and
+piglit's GL profile measured (M35, M36) -- and runs OpenGL ES 2.0 programs:
+clears on the GPU (`sgx-gl
 glclear 100`: every pixel right, ~60 ms a clear with its read-back), and
 draws on the GPU: vertex shaders (M18: with viewports and culling; points,
 lines, flat shading and clip planes still go through Gallium's draw module
@@ -25,7 +28,7 @@ window, M13a).
 | `fetch.sh` | Mesa at the pinned tag into `build/mesa/src`, on the host (git under emulation is far too slow) |
 | `build.sh` | put the driver in, configure, build, install, build `glclear`, `gltri` and `glfs` — inside the `cascadia-mesa` image |
 | `Dockerfile` | that image: Alpine 3.24 armv7 with Mesa's build tools |
-| `install.py` | onto the iPad, over ssh or into the NFS root, as `tools/sgx/mkpack.py` does it |
+| `install.py` | onto the iPad, over ssh or into the NFS root, as `tools/sgx/mkpack.py` does it; `/etc/ld-musl-armhf.path` makes it the system's OpenGL (M35) |
 | `sgx-gl` | on the device: run a program with this Mesa instead of the system's |
 | `frame-bisect` | on the device: a clear through each `SGX_FRAME` variant, to find a wrong piece of the template frame |
 | `host/` | the driver on a Linux PC through drm-shim: `build.sh [arm]`, `run`, a fake template frame, drm-shim's patch for armhf glibc; `usse-test.py`, the USSE encoder against the disassembler; `rt-test.py`, the render target code against the kext's (`rtemu.py`), 61 sizes; `tmpl-test.py`, the template frame Mesa builds against sgx2d's pack |
@@ -80,6 +83,13 @@ sgx-gl glvary                    # 1 to 8 vec4 varyings, each read back; a mat3 
                                  # whole numbers through varyings as ints, int division (M31)
 sgx-gl glldr                     # uniforms past sa's 128 words, read from memory (M32)
 sgx-gl glflow                    # texture lookups, dFdx/dFdy in programs that branch (M33)
+sgx-gl glfetch                   # texture lookups the PDS makes before the program (M35);
+                                 # SGX_NOFETCH=1: all in the program
+sgx-gl gldesk                    # desktop OpenGL 2.1: 1D, sRGB and rectangle textures, the
+                                 # fixed-function pipeline (M35, M36)
+SGX_STATE=16:0x200 sgx-gl glflat # which vertex's colour a triangle takes (finding flat
+                                 # shading, M36)
+SGX_DEBUG_NIR=1 sgx-gl glfs mad  # the NIR the compiler takes (M36)
 SGX_LDR_PROBE=e8870004a0008080 sgx-gl glldr --probe   # a program of those words: VLDST
 SGX_FETCH_TAG=9 sgx-gl glvary    # the vertices a vertex task takes, less one (M30: 9 is
                                  # what overlapped the outputs of three varyings and more)

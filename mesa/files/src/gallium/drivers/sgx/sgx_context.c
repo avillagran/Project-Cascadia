@@ -283,11 +283,17 @@ cpu_blit(struct pipe_context *pctx, const struct pipe_blit_info *info)
    float *in, *out;
    int sw = abs(sb->width), sh = abs(sb->height), dw = abs(db->width), dh = abs(db->height);
 
-   if (!info->mask || (info->mask & ~PIPE_MASK_RGBA))
+   bool zs = info->mask & PIPE_MASK_ZS;
+
+   /* colour, or depth and stencil (M35: their maps go through the ISP's
+    * tiles) -- not both */
+   if (!info->mask || (zs && (info->mask & PIPE_MASK_RGBA)) ||
+       (zs && (!util_format_is_depth_or_stencil(info->src.format) ||
+               !util_format_is_depth_or_stencil(info->dst.format))) ||
+       (!zs && (util_format_is_depth_or_stencil(info->src.format) ||
+                util_format_is_depth_or_stencil(info->dst.format))))
       return false;
-   if (util_format_is_depth_or_stencil(info->src.format) ||
-       util_format_is_depth_or_stencil(info->dst.format) ||
-       util_format_is_compressed(info->dst.format) || info->scissor_enable ||
+   if (util_format_is_compressed(info->dst.format) || info->scissor_enable ||
        info->alpha_blend || sb->depth != 1 || db->depth != 1 || !sw || !sh || !dw || !dh)
       return false;
    /* the boxes as maps take them: x, y their least corner */
@@ -318,7 +324,33 @@ cpu_blit(struct pipe_context *pctx, const struct pipe_blit_info *info)
    }
    in = MALLOC(4 * sw * sizeof(float));
    out = MALLOC(4 * dw * sizeof(float));
-   for (int y = 0; in && out && y < dh; y++) {
+   for (int y = 0; zs && in && out && y < dh; y++) {
+      /* depth as floats, stencil as bytes (in the same rows) */
+      int dy = db->height < 0 ? dh - 1 - y : y;
+      int sy = (int)(((float)y + 0.5f) * sh / dh);
+      uint8_t *drow = dst + dy * dt->stride, *sst = (uint8_t *)(in + sw),
+              *dst8 = (uint8_t *)(out + dw);
+
+      sy = sb->height < 0 ? sh - 1 - sy : sy;
+      if (info->mask & PIPE_MASK_Z)
+         util_format_unpack_z_float(info->src.format, in, src + sy * st->stride, sw);
+      if (info->mask & PIPE_MASK_S)
+         util_format_unpack_s_8uint(info->src.format, sst, src + sy * st->stride, sw);
+      for (int x = 0; x < dw; x++) {
+         int dx = db->width < 0 ? dw - 1 - x : x;
+         int sx = (int)(((float)x + 0.5f) * sw / dw);
+
+         sx = sb->width < 0 ? sw - 1 - sx : sx;
+         out[dx] = in[sx];
+         dst8[dx] = sst[sx];
+      }
+      if ((info->mask & PIPE_MASK_Z) && util_format_has_depth(util_format_description(info->dst.format)))
+         util_format_pack_z_float(info->dst.format, drow, out, dw);
+      if ((info->mask & PIPE_MASK_S) &&
+          util_format_has_stencil(util_format_description(info->dst.format)))
+         util_format_pack_s_8uint(info->dst.format, drow, dst8, dw);
+   }
+   for (int y = 0; !zs && in && out && y < dh; y++) {
       /* the destination's row y (counted the way its box goes) from the
        * source's nearest */
       int dy = db->height < 0 ? dh - 1 - y : y;
@@ -352,7 +384,8 @@ sgx_blit(struct pipe_context *pctx, const struct pipe_blit_info *info)
 {
    if (util_try_blit_via_copy_region(pctx, info, false) || cpu_blit(pctx, info))
       return;
-   mesa_logw_once("sgx: a blit of depth or stencil, or scissored or blended: not done yet");
+   mesa_logw_once("sgx: a blit scissored or blended, or of colour and depth at once: not "
+                  "done yet");
 }
 
 static void
@@ -749,6 +782,7 @@ sgx_context_destroy(struct pipe_context *pctx)
    if (pctx->stream_uploader)
       u_upload_destroy(pctx->stream_uploader);
    sgx_fence_reference(&ctx->last, NULL);
+   pipe_resource_reference(&ctx->no_colour, NULL);
    slab_destroy_child(&ctx->transfer_pool);
    FREE(ctx);
 }

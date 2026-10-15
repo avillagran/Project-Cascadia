@@ -417,9 +417,8 @@ update_vertex_info(struct sgx_context *ctx)
       /* a compiled fragment shader: its inputs, in its order, all F32 */
       const struct sgx_fs *fs = ctx->draw_fs;
 
-      for (unsigned i = 0; i < fs->prog.ninputs; i++)
-         if (fs->input_slot[i] != VARYING_SLOT_POS)     /* gl_FragCoord: iterated, not sent */
-            emit_varying(ctx, vinfo, fs->input_slot[i]);
+      for (unsigned i = 0; i < fs->prog.nvaryings; i++)
+         emit_varying(ctx, vinfo, fs->varying_slot[i]);
       draw_compute_vertex_size(vinfo);
       ctx->layout.nvaryings = fs->prog.nvaryings;
       ctx->layout.f32 = (1u << fs->prog.nvaryings) - 1;
@@ -565,12 +564,15 @@ fs_for_draw(struct sgx_context *ctx)
          key.tex_swap |= swap << unit;
          key.tex_x8 |= x8 << unit;
       }
+      if (unit < 8 && view && util_format_is_srgb(view->format))
+         key.tex_srgb |= 1u << unit;
    }
    /* gl_FrontFacing: which winding is the front */
    if (ctx->rast && ctx->rast->front_ccw &&
        BITSET_TEST(sh->nir->info.system_values_read, SYSTEM_VALUE_FRONT_FACE))
       key.front_ccw = 1;
-   if (!key.enable && key.colormask == 0xf && !key.tex_swap && !key.tex_x8 && !key.front_ccw)
+   if (!key.enable && key.colormask == 0xf && !key.tex_swap && !key.tex_x8 && !key.tex_srgb &&
+       !key.front_ccw)
       return sh->compiled;
    for (unsigned i = 0; i < sh->nvariants; i++)
       if (sh->variant[i]->blend.enable == key.enable &&
@@ -583,6 +585,7 @@ fs_for_draw(struct sgx_context *ctx)
           sh->variant[i]->blend.colormask == key.colormask &&
           sh->variant[i]->blend.tex_swap == key.tex_swap &&
           sh->variant[i]->blend.tex_x8 == key.tex_x8 &&
+          sh->variant[i]->blend.tex_srgb == key.tex_srgb &&
           sh->variant[i]->blend.front_ccw == key.front_ccw)
          return sh->variant[i];
    if (!(fs = sgx_compile_fs(sh->nir, &key, why, sizeof(why)))) {
@@ -629,7 +632,7 @@ sgx_batch_uses(struct sgx_context *ctx, struct pipe_resource *p)
 
    if (!b->ndraws || !p)
       return false;
-   if (b->rt == p)
+   if (b->rt == p || b->zs == p)
       return true;
    for (unsigned i = 0; i < b->ntex; i++)
       if (b->tex[i] == p)
@@ -914,6 +917,7 @@ sgx_batch_flush_at(struct sgx_context *ctx, const char *file, int line)
       sgx_bo_destroy(b->bos[i]);
    }
    b->ndraws = b->ntex = b->nbos = b->nfloats = b->nbytes = b->nsa = b->nidx = 0;
+   b->tex_bytes = 0;
    b->seq++;
    bury(ctx);
 }
@@ -986,10 +990,32 @@ static bool
 fb_target(struct sgx_context *ctx, struct sgx_frame_target *t)
 {
    struct pipe_surface *surf = &ctx->fb.cbufs[0];
+   struct pipe_resource *zs = ctx->fb.zsbuf.texture;
 
-   if (ctx->fb.nr_cbufs < 1 || !surf->texture)
+   if (ctx->fb.nr_cbufs >= 1 && surf->texture) {
+      *t = (struct sgx_frame_target){ sgx_resource(surf->texture), surf->level, surf->first_layer };
+      return true;
+   }
+   /* depth and stencil alone (a shadow map, M35): the render still ends
+    * its tiles' colour somewhere -- a target of the depth buffer's size
+    * nobody reads */
+   if (!zs)
       return false;
-   *t = (struct sgx_frame_target){ sgx_resource(surf->texture), surf->level, surf->first_layer };
+   if (!ctx->no_colour || ctx->no_colour->width0 != zs->width0 ||
+       ctx->no_colour->height0 != zs->height0) {
+      const struct pipe_resource templ = {
+         .target = PIPE_TEXTURE_2D, .format = PIPE_FORMAT_B8G8R8A8_UNORM,
+         .width0 = zs->width0, .height0 = zs->height0, .depth0 = 1, .array_size = 1,
+         .bind = PIPE_BIND_RENDER_TARGET,
+      };
+
+      sgx_batch_flush(ctx);
+      pipe_resource_reference(&ctx->no_colour, NULL);
+      ctx->no_colour = ctx->base.screen->resource_create(ctx->base.screen, &templ);
+      if (!ctx->no_colour)
+         return false;
+   }
+   *t = (struct sgx_frame_target){ sgx_resource(ctx->no_colour), 0, 0 };
    return true;
 }
 
@@ -1018,6 +1044,40 @@ static unsigned
 batch_bytes(const struct sgx_batch *b)
 {
    return b->nfloats * sizeof(float) + b->nbytes + 2 * b->nidx;
+}
+
+/* The memory a texture holds, its content and the sampler's copy.  A
+ * render's textures stay referenced until it is made, so past
+ * SGX_BATCH_TEX_BYTES of them it goes first: a program making, drawing
+ * with and deleting textures (piglit's streaming-texture-leak: 5000 of 4
+ * MiB) kept them all for one render, and the kernel's pages ran out (M35). */
+#define SGX_BATCH_TEX_BYTES (48u << 20)
+
+static uint64_t
+tex_bytes(struct pipe_resource *p)
+{
+   struct sgx_resource *r = sgx_resource(p);
+
+   return (r->bo ? r->bo->size : 0) + (r->tw ? r->tw->size : 0);
+}
+
+/* whether these textures fit in the render with the ones it has (one
+ * draw's alone always do) */
+static bool
+tex_room(struct sgx_context *ctx, struct pipe_resource **tex, unsigned ntex)
+{
+   struct sgx_batch *b = &ctx->batch;
+   uint64_t n = b->tex_bytes;
+
+   for (unsigned i = 0; i < ntex; i++) {
+      unsigned k;
+
+      for (k = 0; k < b->ntex && b->tex[k] != tex[i]; k++)
+         ;
+      if (k == b->ntex)
+         n += tex_bytes(tex[i]);
+   }
+   return !b->ndraws || n <= SGX_BATCH_TEX_BYTES;
 }
 
 /* how many more buffers the render would list for the kernel with these
@@ -1055,6 +1115,7 @@ add_handles(struct sgx_context *ctx, struct pipe_resource **tex, unsigned ntex,
       for (k = 0; k < b->ntex && b->tex[k] != tex[i]; k++)
          ;
       if (k == b->ntex) {
+         b->tex_bytes += tex_bytes(tex[i]);
          pipe_resource_reference(&b->tex[b->ntex], tex[i]);
          b->handles[b->ntex++] = sgx_resource(tex[i])->sampled->handle;
       }
@@ -1186,7 +1247,7 @@ add_vs_draw(struct sgx_context *ctx, struct sgx_vs *vs, const struct sgx_fs *fs,
     * buffers */
    if (b->ndraws == sgx_frame_max_draws(screen->frame) ||
        b->ntex + b->nbos + more_handles(ctx, tex, ntex, v->bos, v->nbos) > SGX_FRAME_MAX_HANDLES ||
-       batch_bytes(b) + nbytes + 2 * nidx > SGX_FRAME_MAX_BYTES) {
+       !tex_room(ctx, tex, ntex) || batch_bytes(b) + nbytes + 2 * nidx > SGX_FRAME_MAX_BYTES) {
       sgx_batch_flush(ctx);
       if (nbytes + 2 * nidx > SGX_FRAME_MAX_BYTES ||
           more_handles(ctx, tex, ntex, v->bos, v->nbos) > SGX_FRAME_MAX_HANDLES) {
@@ -1334,7 +1395,7 @@ submit(struct sgx_context *ctx)
 
    /* SGX_FRAME=packvertex, packpixel: the pack's sides, a render a draw,
     * M13a's colour (debugging only) */
-   if (!vs && (sgx_frame_options() & (SGX_FRAME_PACKVTX | SGX_FRAME_PACKPIX)) &&
+   if (!vs && (sgx_frame_options() & (SGX_FRAME_PACKVTX | SGX_FRAME_PACKPIX)) && rt &&
        !surf->level && !surf->first_layer) {
       sgx_batch_flush(ctx);
       max = sgx_frame_max_vertices(screen->frame, &ctx->layout);
@@ -1384,24 +1445,27 @@ submit(struct sgx_context *ctx)
          struct pipe_sampler_view *view = unit < ARRAY_SIZE(ctx->fs_views) ?
                                           ctx->fs_views[unit] : NULL;
          struct sgx_resource *t = view ? sgx_resource(view->texture) : NULL;
-         bool swap, x8;
+         const struct pipe_sampler_state *ss = unit < PIPE_MAX_SAMPLERS ?
+                                               ctx->fs_samplers[unit] : NULL;
 
          /* its copy is about to be made again (or it is the target):
           * what was gathered reads the old one, so render that first --
           * one sampled as it is has no copy */
          if (t && sgx_batch_uses(ctx, &t->base) &&
-             (&t->base == b->rt ||
-              (!sgx_resource_linear(t, &swap, &x8) && (!t->tw || t->tw_seq != t->seq))))
+             (&t->base == b->rt || sgx_resource_copy_stale(t, view, ss)))
             sgx_batch_flush(ctx);
-         if (!t || !sgx_resource_texture(screen, t, unit < PIPE_MAX_SAMPLERS ?
-                                         ctx->fs_samplers[unit] : NULL,
-                                         sa + fs->sampler_sa + 4 * i)) {
+         if (!t || !sgx_resource_texture(screen, t, view, ss, sa + fs->sampler_sa + 4 * i)) {
             mesa_logw_once("sgx: a draw samples a texture unit with nothing it can "
                            "sample bound: dropped");
             ctx->nverts = 0;
             return;
          }
          tex[i] = &t->base;
+         if (fs->scale_sa >= 0) {
+            float scale[2] = { 1.0f / t->base.width0, 1.0f / t->base.height0 };
+
+            memcpy(sa + fs->scale_sa + 2 * i, scale, sizeof(scale));
+         }
       }
       if (fs->blend_sa >= 0)
          memcpy(sa + fs->blend_sa, ctx->blend_color.color, 4 * sizeof(float));
@@ -1449,7 +1513,7 @@ submit(struct sgx_context *ctx)
       /* room in this render: a draw, its vertices, its textures */
       if (b->ndraws == sgx_frame_max_draws(screen->frame) ||
           b->ntex + b->nbos + more_handles(ctx, tex, ntex, NULL, 0) > SGX_FRAME_MAX_HANDLES ||
-          batch_bytes(b) + n * vf * sizeof(float) > SGX_FRAME_MAX_BYTES)
+          !tex_room(ctx, tex, ntex) || batch_bytes(b) + n * vf * sizeof(float) > SGX_FRAME_MAX_BYTES)
          sgx_batch_flush(ctx);
       if (!grow((void **)&b->verts, &b->maxfloats, b->nfloats + n * vf, sizeof(float)) ||
           !grow((void **)&b->sa, &b->maxsa, b->nsa + nsa, sizeof(uint32_t)))
@@ -1457,7 +1521,7 @@ submit(struct sgx_context *ctx)
       if (!b->ndraws)
          batch_start(ctx, &target);
       /* from now on sampled linear: decided before any draw samples it */
-      rt->gpu_written = true;
+      target.res->gpu_written = true;
       add_handles(ctx, tex, ntex, NULL, 0);
       note_zs(ctx, &st);
       bd = &b->draw[b->ndraws++];
@@ -1493,8 +1557,6 @@ quad(struct sgx_context *ctx, const struct pipe_scissor_state *sc, float d,
    static const struct sgx_frame_layout l = { .nvaryings = 1, .f32 = 1, .colour = 0 };
    struct sgx_screen *screen = sgx_screen(ctx->base.screen);
    struct sgx_batch *b = &ctx->batch;
-   struct pipe_surface *surf = &ctx->fb.cbufs[0];
-   struct sgx_resource *rt = surf->texture ? sgx_resource(surf->texture) : NULL;
    unsigned vf = sgx_frame_vertex_floats(&l);
    /* the rectangle in clip space, through the target's whole viewport (rows
     * from the first: gallium's framebuffer space), at the depth d */
@@ -1512,7 +1574,7 @@ quad(struct sgx_context *ctx, const struct pipe_scissor_state *sc, float d,
    struct sgx_batch_draw *bd;
    int ret;
 
-   if (!rt || !ctx->fb.width || !ctx->fb.height || !fb_target(ctx, &target) ||
+   if (!ctx->fb.width || !ctx->fb.height || !fb_target(ctx, &target) ||
        !sgx_frame_can_render(screen->frame, &target))
       return false;
    if (batch_elsewhere(b, &target)) {
@@ -1536,7 +1598,7 @@ quad(struct sgx_context *ctx, const struct pipe_scissor_state *sc, float d,
       return false;
    if (!b->ndraws)
       batch_start(ctx, &target);
-   rt->gpu_written = true;
+   target.res->gpu_written = true;
    bd = &b->draw[b->ndraws++];
    memset(bd, 0, sizeof(*bd));
    bd->l = l;
@@ -1653,9 +1715,8 @@ vs_for_draw(struct sgx_context *ctx, const struct sgx_fs *fs, const uint8_t *att
 
    if (!sh || !sh->nir || sh->vs_failed)
       return NULL;
-   for (unsigned i = 0; i < fs->prog.ninputs; i++)
-      if (fs->input_slot[i] != VARYING_SLOT_POS)
-         slot[n++] = fs->input_slot[i];
+   for (unsigned i = 0; i < fs->prog.nvaryings; i++)
+      slot[n++] = fs->varying_slot[i];
    /* (as sgx_compile_vs fills it in) */
    for (unsigned a = 0; a < SGX_VS_MAX_ATTRIBS; a++)
       key.b[a] = a < sh->vs_nattrs ? attr[a] : SGX_ATTR(SGX_ATTR_CONST, 4);
