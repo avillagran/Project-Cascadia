@@ -2540,6 +2540,17 @@ release build goes on (`nir_lower_passthrough_edgeflags`, softpipe too;
 `maxLevels != 0` for a 3D proxy texture): the system's build should be the
 release one.
 
+**X on the GPU.** With the driver's Mesa the system's OpenGL, Xorg's
+modesetting driver takes glamor on it -- "glamor: Using OpenGL 2.1 context
+... X acceleration enabled on PowerVR SGX543MP2" -- and XFCE comes up drawn
+by the GPU, its programs' GLX direct (glxinfo: OpenGL 2.1, the SGX543MP2;
+glxgears at the display's 60 Hz), AIGLX the same driver (the X server
+looks for it in /usr/lib/dri: a link there). `mesa/install.py` puts the
+configuration in /etc/X11/sgx.conf.d (modesetting, glamor) and `desktop`
+(tools/desktop/xfce-setup.sh) starts X from it when it is there --
+`DESKTOP_FB=1` for fbdev as before. xwd and xdotool are on the iPad for
+screenshots.
+
 **What the rest needs** -- most of it the hardware's, not found by flipping
 bits:
 

@@ -13,7 +13,9 @@ Installs /usr/local/lib/sgx-mesa (libGL, libEGL, libGLESv1_CM, libGLESv2,
 libgbm, libgallium, the test programs) and makes it the system's OpenGL:
 /etc/ld-musl-armhf.path puts its lib ahead of /usr/lib, so every program
 loads this Mesa, not Alpine's (which stays installed; the file taken away,
-it is back).  /usr/local/bin/sgx-gl runs a program with another build
+it is back) -- and X's configuration for the GPU, /etc/X11/sgx.conf.d
+(modesetting and glamor, which `desktop` takes when it is there).
+/usr/local/bin/sgx-gl runs a program with another build
 (SGX_MESA=dir).  MESA_BUILD=release installs the release build.  Where
 things go is decided as tools/sgx/mkpack.py decides it for SuperTux, with
 its helpers.
@@ -34,6 +36,18 @@ BUILT = os.path.join(ROOT, 'build', 'mesa',
 # Mesa's ahead of the system's
 LD_PATH = 'etc/ld-musl-armhf.path'
 LD_PATH_TEXT = '/lib\n/%s/lib\n/usr/local/lib\n/usr/lib\n' % PREFIX
+# X on the GPU (M36): modesetting with glamor, a configuration directory of
+# its own (`desktop` uses it; tools/desktop/xfce-setup.sh) -- and the driver
+# where the X server's GLX looks for it (AIGLX: /usr/lib/dri)
+X_CONF = 'etc/X11/sgx.conf.d/20-sgx.conf'
+X_CONF_TEXT = '''Section "Device"
+    Identifier "SGX543MP2"
+    Driver     "modesetting"
+    Option     "kmsdev" "/dev/dri/card0"
+    Option     "AccelMethod" "glamor"
+EndSection
+'''
+AIGLX = 'usr/lib/dri/apple_sgx_dri.so'
 
 
 def fail(msg):
@@ -53,9 +67,14 @@ def tarball():
         ln.type, ln.linkname, ln.mode = tarfile.SYMTYPE, '/' + PREFIX + '/bin/sgx-gl', 0o777
         ln.mtime = int(time.time())
         t.addfile(ln)
-        path = own(tarfile.TarInfo(LD_PATH))
-        path.size, path.mode, path.mtime = len(LD_PATH_TEXT), 0o644, int(time.time())
-        t.addfile(path, io.BytesIO(LD_PATH_TEXT.encode()))
+        for name, text in ((LD_PATH, LD_PATH_TEXT), (X_CONF, X_CONF_TEXT)):
+            f = own(tarfile.TarInfo(name))
+            f.size, f.mode, f.mtime = len(text), 0o644, int(time.time())
+            t.addfile(f, io.BytesIO(text.encode()))
+        ln = own(tarfile.TarInfo(AIGLX))
+        ln.type, ln.linkname, ln.mode = tarfile.SYMTYPE, '/' + PREFIX + '/lib/dri/apple_sgx_dri.so', 0o777
+        ln.mtime = int(time.time())
+        t.addfile(ln)
     return buf.getvalue()
 
 
