@@ -2529,7 +2529,13 @@ packages, as binutils were).
   shader worse: 32 comparisons first, then the chain that reads them.) The
   tests still fail: they compare a varying that is the same at every vertex
   with `!=`, and the TSP's plane is not exact unless the triangle's size is
-  a power of two (M31) -- flat interpolation would make it exact.
+  a power of two (M31) -- flat interpolation would make it exact. The new
+  order is not always the better one: dEQP's
+  `tmp_array.vec3_dynamic_write_dynamic_read_fragment` came to 67 registers a
+  pixel with it (64 at most) and was drawn the M13a way -- the one case the
+  whole run (r37) had worse. A shader short of registers is compiled again
+  in NIR's own order now (`keep_order`); r38's shaders, texture and
+  fragment_ops groups are r36's again, that case passing.
 - `SGX_DEBUG_NIR=1` prints the shader as the compiler takes it;
   `SGX_ITER_XOR=mask` flips bits of every iterate's control word.
 
@@ -2550,6 +2556,18 @@ configuration in /etc/X11/sgx.conf.d (modesetting, glamor) and `desktop`
 (tools/desktop/xfce-setup.sh) starts X from it when it is there --
 `DESKTOP_FB=1` for fbdev as before. xwd and xdotool are on the iPad for
 screenshots.
+
+**Tools that were the session's own** are the repository's now:
+`mesa/devbuild.sh [release]` (a build beside the system's, in
+`/root/devbuilds`, with `/root/sgx-dev` to run programs with it and
+`/root/hangs.sh` to count timed-out renders since a point),
+`tools/device-apk.sh PKG...` (Alpine's armhf packages onto the iPad without
+its network: binutils, gdb, waffle, mako, xwd and xdotool went that way),
+`tools/piglit/install.sh` and `pigsum.py`, `tools/desktop/xshot.py` (X
+screenshots, as PNG). `./cascadia mesa` builds and installs the release
+build now (`MESA_BUILD=debug` for assertions).
+
+dEQP-GLES2 after all of it: 16 859 pass, 91 fail, as before M35.
 
 **What the rest needs** -- most of it the hardware's, not found by flipping
 bits:

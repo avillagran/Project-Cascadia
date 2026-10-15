@@ -143,7 +143,7 @@ the device:
 ssh root@10.55.0.2 'dmesg | grep -E "AIC1-REARM|LATE-SMOKE|SOF-TIMER|AIC-TIMER|P105:"'
 ```
 
-## Where it stands (2026-09-27)
+## Where it stands (2026-10-15)
 
 Everything below this section is the lab log, oldest first; a status line in it
 is true as of its date. Now:
@@ -153,10 +153,11 @@ is true as of its date. Now:
 - Wi-Fi (BCM4334 over HSIC): `wifi` on the device — see "WI-FI" at the end
 - the NAND, read-only: `ios mount` puts iOS's System partition on /mnt/ios;
   `nandctl` for the chips themselves — see "THE NAND" at the end
-- XFCE: `tools/desktop/xfce-setup.sh`, then `desktop`
-- the GPU, 2D: `./cascadia gpu`, then `supertux-gpu` (docs/GPU.md); a render node
-  (`/dev/dri/renderD128`) for the Mesa driver to come (docs/research/p105-mesa.md);
-  no OpenGL yet
+- XFCE: `tools/desktop/xfce-setup.sh`, then `desktop` -- on the GPU (Xorg,
+  glamor) once the GPU's OpenGL is installed
+- the GPU, 2D: `./cascadia gpu`, then `supertux-gpu` (docs/GPU.md)
+- the GPU's OpenGL: `./cascadia mesa` -- the system's OpenGL ES 1.1/2.0 and desktop
+  OpenGL 2.1 (GLX, EGL, GBM); see "THE GPU'S OPENGL" at the end
 - not there: USB host, NAND as Linux's own storage (planned for Pi Pico
   users, at the cost of iOS — README, "Where Linux keeps its files")
 
@@ -1265,3 +1266,44 @@ frames and touches in dmesg; `z2-boot -p N -N` reads the frames itself, without 
 - Storage policy (README, "Where Linux keeps its files"): with kDFU the NAND stays
   iOS's (NFS or RAM for Linux); with a Pi Pico it can be Linux's, iOS erased —
   planned, not written.
+
+# ═══════════════════════════════════════════════════════════════
+# THE GPU'S OPENGL (2026-10-15) — Mesa, docs/research/p105-mesa.md
+# ═══════════════════════════════════════════════════════════════
+
+- The driver: `mesa/files/src/gallium/drivers/sgx` (Gallium; the compiler is
+  `sgx_compiler.c`, NIR to USSE), built into Mesa 26.1.8 in the `cascadia-mesa`
+  image (`mesa/build.sh`, Alpine armv7 under emulation: the first build ~1 h, a
+  change ~3-5 min). Needs `./cascadia gpu` first (the template frame).
+- `./cascadia mesa`: a release build into `/usr/local/lib/sgx-mesa`, made the
+  system's OpenGL by `/etc/ld-musl-armhf.path` (its lib ahead of `/usr/lib`;
+  Alpine's Mesa stays installed -- delete the file to go back), X's GPU
+  configuration in `/etc/X11/sgx.conf.d`, `/usr/lib/dri/apple_sgx_dri.so` for
+  AIGLX. `MESA_BUILD=debug ./cascadia mesa` for assertions.
+- A build beside the system's, to try a change: `mesa/devbuild.sh [release]`
+  -> `/root/devbuilds/N`, `/root/sgx-mesa-cur` (`-rel`); run with
+  `/root/sgx-dev PROGRAM` (`SGX_MESA=dir` another build). GPU hangs since a
+  point: `T=$(/root/hangs.sh now); ...; sleep 3; /root/hangs.sh $T`.
+- Tests on the iPad: `sgx-gl glfs`, `gltex`, `glflow`, `glfetch`, `gldesk`, ...
+  (`tools/sgx/gl`, mesa/README.md lists them); dEQP-GLES2 in `/root/deqp`
+  (`tools/sgx/deqp-run.py`, ~30 min: 16 859 pass / 91 fail); piglit in
+  `/root/piglit` (`tools/piglit`: build.sh, install.sh, run.sh NAME, ~40 min;
+  `python3 /root/pigsum.py /root/piglit-results/NAME`).
+- Packages for the iPad without its network: `tools/device-apk.sh PKG...`
+  (armhf from docker, installed offline). On it now: binutils, gdb, waffle,
+  py3-mako, xwd, xdotool, sdl3-dbg, musl-dbg.
+- X screenshots: `python3 tools/desktop/xshot.py out.png [:0]`.
+- iOS's GL driver as the oracle: `bash tools/shadercap.sh` with the iPad in iOS
+  (corpus + OpenGL ES 1 cases, render commands logged), then
+  `python3 tools/iosgpu/corpus.py logs/ios/corpus/DATE [--pds|--state|--own] [CASE]`.
+
+| trap | what to do |
+|---|---|
+| a program crashes on an assertion inside Mesa (`maxLevels != 0`, edge flags) | a debug build: the system's should be the release one (`./cascadia mesa` is) |
+| piglit: `No module named 'framework.backends.'` | a Mac's tar added `._*` files: `tools/piglit/install.sh` (COPYFILE_DISABLE, deletes them) |
+| piglit's test binaries: `symbol not found` | `LD_LIBRARY_PATH=/root/piglit/lib/piglit/lib` (run.sh sets it) |
+| piglit with `PIGLIT_PLATFORM=surfaceless_egl` aborts | GBM (`run.sh` uses it) |
+| the OOM killer during piglit | a test making textures without end: renders now go when they hold 48 MiB of textures; `streaming-texture-leak` is left out of run.sh (25 min alone) |
+| `dmesg \| grep -c "not done after"` counts old hangs | the ring buffer rolls and the message comes ~2 s late: `hangs.sh` with a timestamp, `sleep 3` first |
+| a scratch script named `dis.py` breaks Python (`import dis`) | don't name helpers after stdlib modules; run tools with `python3 -I` |
+| SuperTux `--renderer opengl` exits ("Missing GL version", GL_MAJOR_VERSION) | SuperTux 0.6.3 asks GL 3's query in its GL 2 path: `--renderer sdl` (tools/sgx/supertux-mesa.sh) |

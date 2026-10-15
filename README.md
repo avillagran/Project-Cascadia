@@ -133,14 +133,22 @@ including the parts that didn't work.
       code under an emulator. On that sits `sgx2d`, a small 2D
       library (textured quads, colour modulation, three blend modes, full
       screen), and an SDL2 renderer shim: `supertux-gpu` runs SuperTux with a
-      touch gamepad. No OpenGL — that would take a shader compiler. Set up
+      touch gamepad (OpenGL came after: below). Set up
       with one command, `./cascadia gpu`; details and controls:
       [docs/GPU.md](docs/GPU.md); how it was found, wrong
       turns included: [docs/research/p105-gpu.md](docs/research/p105-gpu.md)
-- [ ] OpenGL through Mesa — under way: the kernel driver has a DRM render
-      node, and a Gallium driver in [mesa/](mesa/) runs OpenGL ES 2.0
-      programs with clears on the GPU — 100 of them, every pixel right
-      (2026-10-04); draws wait for the shader compiler. The plan:
+- [x] OpenGL through Mesa — **the system's OpenGL: ES 1.1 and 2.0, desktop
+      2.1 through GLX and EGL** (2026-10-15). A Gallium driver in
+      [mesa/](mesa/) with its own shader compiler (NIR to the GPU's USSE code:
+      branches, loops, texture lookups, derivatives) on the kernel's DRM
+      render node; `./cascadia mesa` builds it and makes it the system's.
+      **XFCE runs on Xorg with glamor on the GPU**, GLX programs beside it;
+      weston and its Wayland clients too; SuperTux through SDL's GL renderer.
+      Measured: dEQP-GLES2 16 859 of 16 950 run, piglit's GL profile 774
+      passing of the ~960 a 2.1 part runs. Not there yet: flat shading,
+      logic ops, discard writing no depth, polygon offset, 3D textures,
+      border colours, occlusion queries (most of it waits for a capture of
+      iOS's driver). How it was found:
       [docs/research/p105-mesa.md](docs/research/p105-mesa.md)
 
 ## Where Linux keeps its files
@@ -715,10 +723,13 @@ initramfs/      stage 1 (/init) and stage 2 (/sbin/p105-stage2) -- the boot
                 minirootfs; nothing is edited inside build/
 tools/          p105-peek.c (MMIO tool), build/flash wrappers, LZSS helpers,
                 nand/ (nandctl, iosnand: the NAND, read-only),
-                sgx/ (the GPU: sgx2d, the SDL shim, pack builder), iosgpu/
-                (the iOS capture tool, the kext emulator)
-mesa/           the GPU's Mesa driver (Gallium, OpenGL ES): its files, the
-                patch that registers it, the device build (./cascadia mesa)
+                sgx/ (the GPU: sgx2d, the SDL shim, pack builder, gl/: the
+                driver's tests), iosgpu/ (the iOS capture tool, the kext
+                emulator), piglit/ (the OpenGL test suite for the iPad),
+                desktop/ (XFCE's setup, X screenshots)
+mesa/           the GPU's Mesa driver (Gallium: OpenGL ES 1.1/2.0, OpenGL 2.1):
+                its files, the patch that registers it, the device build
+                (./cascadia mesa; mesa/devbuild.sh for a build beside it)
 docs/           QUICKSTART.md — clean machine to a shell on the device
                 CASCADIA-CHEATSHEET.md — the real reference for working on it
                 GPU.md — the GPU: building, playing SuperTux, how it works

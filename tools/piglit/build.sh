@@ -3,14 +3,20 @@
 # (docs/research/p105-mesa.md, M35): the desktop GL and GLES 2 tests, run
 # through waffle (surfaceless EGL, or GBM / X11 / Wayland).
 #
-# On the host:
+# On the host (the build takes about an hour under emulation):
 #   git clone --depth 1 https://gitlab.freedesktop.org/mesa/piglit.git build/piglit-src
 #   docker build --platform linux/arm/v7 -t cascadia-piglit tools/piglit
-#   docker run --rm --platform linux/arm/v7 -v $PWD:/cascadia cascadia-piglit sh tools/piglit/build.sh
-#   tar cf - -C build/piglit-install . | ssh root@10.55.0.2 'mkdir -p /root/piglit && tar xf - -C /root/piglit'
+#   docker run --rm --init --platform linux/arm/v7 -v $PWD:/cascadia -w /cascadia \
+#       cascadia-piglit sh tools/piglit/build.sh
+#   tools/device-apk.sh waffle py3-mako py3-markupsafe     (once: piglit's own needs)
+#   tools/piglit/install.sh                  /root/piglit, run.sh, pigsum.py
 #
-# On the iPad (a run of the GL 2.1 profile; see tools/piglit/run.sh):
-#   PIGLIT_PLATFORM=surfaceless_egl /root/piglit/bin/piglit run quick_gl /root/piglit-results/NAME
+# On the iPad (the GL profile less GL 3 and 4, about 40 minutes):
+#   /root/piglit/run.sh NAME                 the system's Mesa
+#   WRAP=/root/sgx-dev SGX_MESA=$(readlink -f /root/sgx-mesa-rel) /root/piglit/run.sh NAME
+#   python3 /root/pigsum.py /root/piglit-results/NAME    what did not pass
+# One test alone: LD_LIBRARY_PATH=/root/piglit/lib/piglit/lib PIGLIT_PLATFORM=gbm
+#   PIGLIT_SOURCE_DIR=/root/piglit/lib/piglit /root/piglit/lib/piglit/bin/TEST -auto
 set -eu
 ROOT=/cascadia
 SRC=$ROOT/build/piglit-src
