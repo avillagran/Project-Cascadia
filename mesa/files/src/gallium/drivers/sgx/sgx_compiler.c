@@ -115,6 +115,7 @@ struct comp {
     * (o0): src1 the colour unless swapped (M25) */
    bool sop2, sop2_swap;
    struct usse_sop2 sop2_factors;
+   int logicop;                         /* GL's logic op (pipe_logicop), -1 none (M37) */
    struct operand colour[4];
    bool have_colour[4];
    int kill;                            /* the temporary that is not 0 for a pixel discarded, or -1 */
@@ -1322,6 +1323,90 @@ release(struct comp *c, struct operand o, int index)
    }
 }
 
+/* GL's logic op (M37) as iOS's driver does it (es1 e03..e10): the colour
+ * packed to bytes, then a VBW with the tile's (o0) -- `xor o0, pa0, o0`;
+ * not x is `and c56, ~x`, c56 all ones.  The colour mask after it, on the
+ * bytes (o0 is B G R A, as the target), and a discarded pixel keeps o0:
+ * both through a temporary, the result moved or unpacked at the end. */
+static void
+logic_output(struct comp *c, unsigned base)
+{
+   const unsigned mask = c->fs->blend.colormask;
+   const bool direct = c->kill < 0 && mask == 0xf;
+   struct usse_reg src = treg(c, take(c)), t = treg(c, take(c));
+   struct usse_reg o0 = usse_reg(USSE_OUTPUT, 0), ones = USSE_ALL_ONES;
+   struct usse_reg r = direct ? o0 : t;
+   uint64_t w;
+
+   emit(c, usse_pack_unorm8_to(src, treg(c, base)));
+   switch (c->logicop) {
+   case PIPE_LOGICOP_CLEAR:         w = usse_vbw(USSE_VBW_XOR, r, o0, o0, false); break;
+   case PIPE_LOGICOP_NOR:
+      emit(c, usse_vbw(USSE_VBW_OR, t, src, o0, false));
+      w = usse_vbw(USSE_VBW_AND, r, ones, t, true);
+      break;
+   case PIPE_LOGICOP_AND_INVERTED:  w = usse_vbw(USSE_VBW_AND, r, o0, src, true); break;
+   case PIPE_LOGICOP_COPY_INVERTED: w = usse_vbw(USSE_VBW_AND, r, ones, src, true); break;
+   case PIPE_LOGICOP_AND_REVERSE:   w = usse_vbw(USSE_VBW_AND, r, src, o0, true); break;
+   case PIPE_LOGICOP_INVERT:        w = usse_vbw(USSE_VBW_AND, r, ones, o0, true); break;
+   case PIPE_LOGICOP_XOR:           w = usse_vbw(USSE_VBW_XOR, r, src, o0, false); break;
+   case PIPE_LOGICOP_NAND:
+      emit(c, usse_vbw(USSE_VBW_AND, t, src, o0, false));
+      w = usse_vbw(USSE_VBW_AND, r, ones, t, true);
+      break;
+   case PIPE_LOGICOP_AND:           w = usse_vbw(USSE_VBW_AND, r, src, o0, false); break;
+   case PIPE_LOGICOP_EQUIV:
+      emit(c, usse_vbw(USSE_VBW_XOR, t, src, o0, false));
+      w = usse_vbw(USSE_VBW_AND, r, ones, t, true);
+      break;
+   case PIPE_LOGICOP_NOOP:          w = usse_vbw(USSE_VBW_OR, r, o0, o0, false); break;
+   case PIPE_LOGICOP_OR_INVERTED:   w = usse_vbw(USSE_VBW_OR, r, o0, src, true); break;
+   case PIPE_LOGICOP_COPY:          w = usse_vbw(USSE_VBW_OR, r, src, src, false); break;
+   case PIPE_LOGICOP_OR_REVERSE:    w = usse_vbw(USSE_VBW_OR, r, src, o0, true); break;
+   case PIPE_LOGICOP_OR:            w = usse_vbw(USSE_VBW_OR, r, src, o0, false); break;
+   default:                         w = usse_vbw(USSE_VBW_OR, r, o0, o0, true); break;  /* SET */
+   }
+   if (direct) {
+      emit(c, w | USSE_END);
+      return;
+   }
+   emit(c, w);
+   if (mask != 0xf) {
+      /* t = (t & m) | (o0 & ~m), m the bytes of the channels written */
+      struct usse_reg m = treg(c, take(c));
+      uint32_t bytes = (mask & PIPE_MASK_R ? 0x00ff0000u : 0) |
+                       (mask & PIPE_MASK_G ? 0x0000ff00u : 0) |
+                       (mask & PIPE_MASK_B ? 0x000000ffu : 0) |
+                       (mask & PIPE_MASK_A ? 0xff000000u : 0);
+
+      emit(c, usse_limm(m, bytes));
+      emit(c, usse_vbw(USSE_VBW_AND, t, t, m, false));
+      emit(c, usse_vbw(USSE_VBW_AND, src, o0, m, true));
+      emit(c, usse_vbw(USSE_VBW_OR, t, t, src, false));
+   }
+   if (c->kill < 0) {
+      emit(c, usse_vbw_or(o0, t, 0) | USSE_END);
+      return;
+   }
+   /* discarded: o0 as it was -- the result and the tile's unpacked, the
+    * channels chosen, packed again (exact for bytes) */
+   {
+      unsigned d = block(c, 4, 2);
+
+      emit(c, usse_fmov(treg(c, c->kill + 1), treg(c, c->kill)));
+      emit(c, usse_unpack_unorm8(treg(c, base), t, 0));
+      emit(c, usse_unpack_unorm8(treg(c, base + 2), t, 2));
+      emit(c, usse_unpack_unorm8(treg(c, d), o0, 0));
+      emit(c, usse_unpack_unorm8(treg(c, d + 2), o0, 2));
+      for (unsigned i = 0; i < 4; i++) {
+         usse_fmovc(&w, USSE_TEST_NE0, treg(c, base + i), treg(c, c->kill + (i & 1)),
+                    treg(c, d + i), treg(c, base + i));
+         emit(c, w);
+      }
+      emit(c, usse_pack_unorm8(0, treg(c, base)) | USSE_END);
+   }
+}
+
 /* the colour: four registers in a row, packed into o0 */
 static void
 output(struct comp *c)
@@ -1350,6 +1435,10 @@ output(struct comp *c)
          continue;
       move_into(c, treg(c, base + i), o, &s);
       scratch_give_back(c, &s);
+   }
+   if (c->logicop >= 0) {
+      logic_output(c, base);
+      return;
    }
    if (c->kill >= 0) {
       /* discarded: the pixel keeps the colour its tile holds (o0, as the
@@ -2077,6 +2166,7 @@ compile_fs(const nir_shader *fs, const struct sgx_blend_key *blend, char *why,
 
    c.why = why;
    c.kill = -1;
+   c.logicop = -1;
    c.why_size = why_size;
    why[0] = 0;
    if (!(c.fs = CALLOC_STRUCT(sgx_fs)))
@@ -2094,9 +2184,16 @@ compile_fs(const nir_shader *fs, const struct sgx_blend_key *blend, char *why,
       c.fs->blend.colormask = 0xf;
    /* (discard keeps the tile's colour as the colour: blended again, not
     * kept, M19) */
-   if (blending && !fs->info.fs.uses_discard && !getenv("SGX_NO_SOP2") &&
+   if (blending && !fs->info.fs.uses_discard && !blend->logicop && !getenv("SGX_NO_SOP2") &&
        sop2_blend(blend, &c.sop2_factors, &c.sop2_swap)) {
       c.sop2 = true;
+      blending = false;
+   }
+   /* a logic op instead of the blending, and the colour mask with it: on
+    * the bytes, in output() (nir_lower_blend's are integer operations,
+    * which the compiler has not) */
+   if (blend && blend->logicop) {
+      c.logicop = blend->logicop - 1;
       blending = false;
    }
 
@@ -2265,6 +2362,7 @@ compile_vs(const nir_shader *vs, const unsigned *varying_slot, unsigned nvarying
 
    c.why = why;
    c.kill = -1;
+   c.logicop = -1;
    c.why_size = why_size;
    why[0] = 0;
    if (nvaryings > SGX_FRAME_MAX_VARYINGS || !(c.vs = CALLOC_STRUCT(sgx_vs)))

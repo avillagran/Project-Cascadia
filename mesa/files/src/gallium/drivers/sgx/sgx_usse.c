@@ -327,6 +327,24 @@ usse_vbw_or_rot(struct usse_reg dest, struct usse_reg src1, unsigned imm, unsign
    return vbw_logic(true, dest, src1, imm) | bits(rot, 42, 38);
 }
 
+/* VBW's op 2 (and, or by bit 35) or 3 (xor), src2 a register; bit 43
+ * inverts it (iOS's `and o0, c56, ~pa0`, `or o0, o0, ~o0`) */
+uint64_t
+usse_vbw(enum usse_vbw_op op, struct usse_reg dest, struct usse_reg src1, struct usse_reg src2,
+         bool not2)
+{
+   unsigned dext, dbank, ext1, bank1, ext2, bank2;
+
+   dest_bank(dest, &dext, &dbank);
+   src_bank(src1, &ext1, &bank1);
+   src_bank(src2, &ext2, &bank2);
+   return bits(1, 63, 62) | bits(op == USSE_VBW_XOR ? 3 : 2, 61, 59) | SKIPINV |
+          bits(dext, 51, 51) | bits(ext1, 49, 49) | bits(ext2, 48, 48) | bits(not2, 43, 43) |
+          bits(op == USSE_VBW_OR, 35, 35) | bits(dbank, 33, 32) | bits(bank1, 31, 30) |
+          bits(bank2, 29, 28) | bits(dest.num, 27, 21) | bits(src1.num, 13, 7) |
+          bits(src2.num, 6, 0);
+}
+
 /* VLDST: 111, op 1 (a load), no MOE expansion (with it, more than a word
  * loaded nothing), src0 sa (extended bank 1), src2 the immediate 0 (not
  * added), F32 words; src1 an immediate (extended bank 2) or a register */

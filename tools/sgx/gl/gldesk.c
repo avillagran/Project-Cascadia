@@ -2,7 +2,7 @@
  * (docs/research/p105-mesa.md, M35, M36): a 1D texture, sRGB textures (RGBA
  * and luminance, decoded or not), a rectangle texture (unnormalized
  * coordinates), the fixed-function pipeline (glBegin and client arrays, a
- * texture modulated by the vertex colour).  A 64 x 64 target, every pixel
+ * texture modulated by the vertex colour), logic ops (M37).  A 64 x 64 target, every pixel
  * read back against what C works out.
  *
  *   sgx-gl gldesk [CASE]        (CASE: a name's start; all by default)
@@ -201,6 +201,56 @@ want_ff(float s, float t, float c[4])
 	c[3] = b[3] / 255.0f;
 }
 
+/* the logic ops (M37): the target cleared to bytes 51 102 153 204, then
+ * the program's colour -- bytes 32 i across, 32 j up, 128, 64 -- xor'ed
+ * over it, through a colour mask, and with the left half discarded */
+static const float LOGIC_CLEAR[4] = { 0.2f, 0.4f, 0.6f, 0.8f };
+static const char *LOGIC_BODY =
+	"gl_FragColor = vec4(floor(v * 8.0) * 32.0 / 255.0, 128.0 / 255.0, 64.0 / 255.0);";
+static unsigned logic_mask;
+static int logic_discard;
+
+static void
+want_logic(float s, float t, float c[4])
+{
+	const int src[4] = { 32 * (int)(s * 8), 32 * (int)(t * 8), 128, 64 };
+
+	for (int k = 0; k < 4; k++) {
+		int d = to8(LOGIC_CLEAR[k]);
+
+		c[k] = ((logic_mask >> k & 1) && !(logic_discard && s < 0.5f) ? src[k] ^ d : d) / 255.0f;
+	}
+}
+
+static void
+logic_check(const char *name, unsigned mask, int discard)
+{
+	static const float quad[] = { -1, -1, 1, -1, -1, 1, 1, 1 };
+	char body[256];
+	GLuint p;
+
+	if (only && strncmp(name, only, strlen(only)))
+		return;
+	snprintf(body, sizeof(body), "%s%s", discard ? "if (v.x < 0.5) discard; " : "", LOGIC_BODY);
+	logic_mask = mask;
+	logic_discard = discard;
+	p = program(body);
+	glClearColor(LOGIC_CLEAR[0], LOGIC_CLEAR[1], LOGIC_CLEAR[2], LOGIC_CLEAR[3]);
+	glClear(GL_COLOR_BUFFER_BIT);
+	glEnable(GL_COLOR_LOGIC_OP);
+	glLogicOp(GL_XOR);
+	glColorMask(mask & 1, mask >> 1 & 1, mask >> 2 & 1, mask >> 3 & 1);
+	glEnableVertexAttribArray(0);
+	glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, quad);
+	glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+	glDisableVertexAttribArray(0);
+	glColorMask(1, 1, 1, 1);
+	glDisable(GL_COLOR_LOGIC_OP);
+	glUseProgram(0);
+	glDeleteProgram(p);
+	want_ok(want_logic, 0, name);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -322,6 +372,10 @@ main(int argc, char **argv)
 		}
 		glDisable(GL_TEXTURE_2D);
 	}
+
+	logic_check("a logic op, xor", 0xf, 0);
+	logic_check("a logic op, red and blue masked in", 0x5, 0);
+	logic_check("a logic op, half discarded", 0xf, 1);
 
 	printf("%d of %d cases right\n", cases - failed, cases);
 	eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);

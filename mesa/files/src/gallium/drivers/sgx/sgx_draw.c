@@ -20,6 +20,7 @@
 
 #include <errno.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
 
 #include "compiler/glsl_types.h"
@@ -553,6 +554,10 @@ fs_for_draw(struct sgx_context *ctx)
          key.alpha_dst = rt->alpha_dst_factor;
       }
    }
+   /* GL's logic ops: the program's too, on the colour and the tile's as
+    * bytes (iOS's es1 e03..e10) */
+   if (ctx->blend && ctx->blend->logicop_enable)
+      key.logicop = ctx->blend->logicop_func + 1;
    /* textures sampled linear in other orders than B G R A (M16) */
    for (unsigned i = 0; i < sh->compiled->nsamplers; i++) {
       unsigned unit = sh->compiled->sampler_unit[i];
@@ -572,21 +577,11 @@ fs_for_draw(struct sgx_context *ctx)
        BITSET_TEST(sh->nir->info.system_values_read, SYSTEM_VALUE_FRONT_FACE))
       key.front_ccw = 1;
    if (!key.enable && key.colormask == 0xf && !key.tex_swap && !key.tex_x8 && !key.tex_srgb &&
-       !key.front_ccw)
+       !key.front_ccw && !key.logicop)
       return sh->compiled;
+   /* (the key is bytes, no padding) */
    for (unsigned i = 0; i < sh->nvariants; i++)
-      if (sh->variant[i]->blend.enable == key.enable &&
-          sh->variant[i]->blend.rgb_func == key.rgb_func &&
-          sh->variant[i]->blend.rgb_src == key.rgb_src &&
-          sh->variant[i]->blend.rgb_dst == key.rgb_dst &&
-          sh->variant[i]->blend.alpha_func == key.alpha_func &&
-          sh->variant[i]->blend.alpha_src == key.alpha_src &&
-          sh->variant[i]->blend.alpha_dst == key.alpha_dst &&
-          sh->variant[i]->blend.colormask == key.colormask &&
-          sh->variant[i]->blend.tex_swap == key.tex_swap &&
-          sh->variant[i]->blend.tex_x8 == key.tex_x8 &&
-          sh->variant[i]->blend.tex_srgb == key.tex_srgb &&
-          sh->variant[i]->blend.front_ccw == key.front_ccw)
+      if (!memcmp(&sh->variant[i]->blend, &key, sizeof(key)))
          return sh->variant[i];
    if (!(fs = sgx_compile_fs(sh->nir, &key, why, sizeof(why)))) {
       mesa_logw_once("sgx: a variant of a fragment shader (blending, texture orders) "

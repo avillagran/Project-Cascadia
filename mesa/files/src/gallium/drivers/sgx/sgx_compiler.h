@@ -22,9 +22,10 @@ struct nir_shader;
 
 /* What a variant of a fragment shader is compiled for.  GL's blending for
  * render target 0, as the shader does it (M14): equations and factors
- * (pipe_blend_func, pipe_blendfactor), the colour mask.  And the texture
- * units sampled linear (sgx_resource_linear(), M16) from memory in R G B A
- * order (red and blue swapped back), and with no alpha; those whose texels
+ * (pipe_blend_func, pipe_blendfactor), the colour mask, or a logic op
+ * (M37).  And the texture units sampled linear (sgx_resource_linear(),
+ * M16) from memory in R G B A order (red and blue swapped back), and with
+ * no alpha; those whose texels
  * are sRGB, decoded after the lookup (GL 2.1's EXT_texture_sRGB: no gamma
  * of the sampler's found, M35).  All zero but colormask 0xf: nothing
  * done. */
@@ -35,6 +36,7 @@ struct sgx_blend_key {
    uint8_t colormask;
    uint8_t tex_swap, tex_x8, tex_srgb;
    uint8_t front_ccw;      /* gallium's, for gl_FrontFacing (0 when not read) */
+   uint8_t logicop;        /* pipe_logicop + 1; 0: none (M37: iOS's are the program's) */
 };
 
 #define SGX_FS_MAX_SAMPLERS 8

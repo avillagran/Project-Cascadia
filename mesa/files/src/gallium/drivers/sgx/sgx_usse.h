@@ -123,6 +123,14 @@ uint64_t usse_vbw_or(struct usse_reg dest, struct usse_reg src1, unsigned imm);
 /* dest = src1 | (imm rotated left by rot): bits past an immediate's 16
  * (M32: an LDR offset's multiplier, 4 << 16) */
 uint64_t usse_vbw_or_rot(struct usse_reg dest, struct usse_reg src1, unsigned imm, unsigned rot);
+/* VBW between two registers (M37, iOS's logic ops, es1 e03..e10): dest =
+ * src1 op src2, src2 inverted first with not2 (`and o0, c56, ~o0`: c56 is
+ * all ones) */
+enum usse_vbw_op { USSE_VBW_AND, USSE_VBW_OR, USSE_VBW_XOR };
+uint64_t usse_vbw(enum usse_vbw_op op, struct usse_reg dest, struct usse_reg src1,
+                  struct usse_reg src2, bool not2);
+/* c56: the constant whose bits are all set */
+#define USSE_ALL_ONES usse_reg(USSE_SPECIAL, 56)
 
 /* Memory loads (VLDST's, Vita3K's vldst; M32): count words in a row, from
  * the address in sa word base plus an offset plus 4 bytes, into dest..
