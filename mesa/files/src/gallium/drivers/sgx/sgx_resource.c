@@ -228,17 +228,14 @@ twiddle_at(const struct twiddle *t, unsigned x, unsigned y)
    return ((t->wide ? x : y) >> t->shift << 2 * t->shift) + t->mx[x & mask] + t->my[y & mask];
 }
 
-/* a row of the texture's content as 8-bit RGBA (depth: grey, alpha 1 --
- * OES_depth_texture's d, d, d, 1) */
+/* a row of the texture's content as 8-bit RGBA -- depth as F32 (M37: the
+ * sampler's F32 format, iOS's m04..m08 read it raw and compare in the
+ * program; the program makes it d, d, d, 1) */
 static void
 unpack_row(enum pipe_format format, const uint8_t *line, unsigned w, uint32_t *row)
 {
    if (util_format_is_depth_or_stencil(format)) {
-      float z[w];
-
-      util_format_unpack_z_float(format, z, line, w);
-      for (unsigned x = 0; x < w; x++)
-         row[x] = 0xff000000u | 0x010101u * (uint32_t)(CLAMP(z[x], 0.0f, 1.0f) * 255.0f + 0.5f);
+      util_format_unpack_z_float(format, (float *)row, line, w);
    } else {
       /* (sRGB as the bytes are: the program decodes them, or not, as the
        * view says) */
@@ -368,6 +365,8 @@ copy_level(const struct sgx_resource *res, unsigned level, unsigned face_layer, 
    }
 }
 
+static bool zs_to_linear(struct sgx_resource *res);
+
 static bool
 copy_texture(struct sgx_context *ctx, struct sgx_resource *res, unsigned first)
 {
@@ -450,9 +449,12 @@ copy_texture(struct sgx_context *ctx, struct sgx_resource *res, unsigned first)
       FREE(row);
       return false;
    }
-   /* what the GPU wrote into the texture, done first */
+   /* what the GPU wrote into the texture, done first -- a depth buffer's
+    * from the ISP's tiles (M37: a shadow map) */
    if (res->gpu_written || res->external)
       sgx_bo_wait(res->bo, -1);
+   if (util_format_is_depth_or_stencil(p->format) && res->zls && res->zls_valid)
+      zs_to_linear(res);
    for (unsigned f = 0; f < faces; f++) {
       uint8_t *dst = out + f * face;
 
@@ -636,6 +638,13 @@ sgx_resource_texture(struct sgx_context *ctx, struct sgx_resource *res,
        * SceGxmTextureType), the format in 28:24, the size: log2 w in 19:16
        * and log2 h in 3:0, or w - 1 in 23:12 and h - 1 in 11:0 */
       native_format(p, &fmt, &swizzle);
+      /* depth: F32 (0x12), its one channel raw; nearest -- the sampler
+       * filters no F32 (iOS has no OES_texture_float_linear) */
+      if (util_format_is_depth_or_stencil(p->format)) {
+         fmt = 0x12;
+         swizzle = 0;
+         words[0] &= ~(1u << 9 | 3u << 10 | 3u << 12);
+      }
       if (cube || (util_is_power_of_two_nonzero(w) && util_is_power_of_two_nonzero(h)))
          words[1] = (cube ? 2u << 29 : 0) | fmt << 24 |
                     util_logbase2(res->tw_w) << 16 | util_logbase2(res->tw_h);

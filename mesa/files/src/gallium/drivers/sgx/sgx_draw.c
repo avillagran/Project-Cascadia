@@ -580,21 +580,38 @@ fs_for_draw(struct sgx_context *ctx)
    if (ctx->blend && ctx->blend->logicop_enable)
       key.logicop = ctx->blend->logicop_func + 1;
    /* (textures sampled linear in other orders than B G R A, M16: their
-    * swizzle in the state words since M37, as a copy's) sRGB textures */
-   for (unsigned i = 0; i < sh->compiled->nsamplers; i++) {
-      unsigned unit = sh->compiled->sampler_unit[i];
-      struct pipe_sampler_view *view = unit < ARRAY_SIZE(ctx->fs_views) ?
-                                       ctx->fs_views[unit] : NULL;
+    * swizzle in the state words since M37, as a copy's) sRGB textures,
+    * depth ones -- the shader's, not its compiled form's (a shadow lookup
+    * compared ALWAYS is a constant there) */
+   for (unsigned unit = 0; unit < 8; unit++) {
+      struct pipe_sampler_view *view = ctx->fs_views[unit];
+
+      if (!BITSET_TEST(sh->nir->info.textures_used, unit))
+         continue;
 
       if (unit < 8 && view && util_format_is_srgb(view->format))
          key.tex_srgb |= 1u << unit;
+      if (unit < 8 && view && util_format_is_depth_or_stencil(view->texture->format)) {
+         const struct pipe_sampler_state *ss = unit < PIPE_MAX_SAMPLERS ?
+                                               ctx->fs_samplers[unit] : NULL;
+
+         key.tex_depth |= 1u << unit;
+         key.depth_swizzle[unit][0] = view->swizzle_r;
+         key.depth_swizzle[unit][1] = view->swizzle_g;
+         key.depth_swizzle[unit][2] = view->swizzle_b;
+         key.depth_swizzle[unit][3] = view->swizzle_a;
+         if (ss && ss->compare_mode == PIPE_TEX_COMPARE_R_TO_TEXTURE) {
+            key.tex_shadow |= 1u << unit;
+            key.shadow_func[unit] = ss->compare_func;
+         }
+      }
    }
    /* gl_FrontFacing: which winding is the front */
    if (ctx->rast && ctx->rast->front_ccw &&
        BITSET_TEST(sh->nir->info.system_values_read, SYSTEM_VALUE_FRONT_FACE))
       key.front_ccw = 1;
    if (!key.enable && key.colormask == 0xf && !key.tex_swap && !key.tex_x8 && !key.tex_srgb &&
-       !key.front_ccw && !key.logicop)
+       !key.front_ccw && !key.logicop && !key.tex_depth)
       return sh->compiled;
    /* (the key is bytes, no padding) */
    for (unsigned i = 0; i < sh->nvariants; i++)
@@ -924,8 +941,10 @@ sgx_batch_flush_at(struct sgx_context *ctx, const char *file, int line)
       sgx_fence_reference(&ctx->last, fence);
       sgx_resource(b->rt)->seq++;
       sgx_resource(b->rt)->gpu_written = true;
-      if (zls.store)
+      if (zls.store) {
          zs->zls_valid = true;
+         zs->seq++;           /* (a depth texture's copy made again, M37) */
+      }
    } else {
       mesa_logw("sgx: a render of %u draws failed (%d)", b->ndraws, ret);
    }

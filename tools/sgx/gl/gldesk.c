@@ -43,7 +43,8 @@ program(const char *fs_body)
 
 	snprintf(fs, sizeof(fs), "#version 120\n#extension GL_ARB_texture_rectangle : enable\n"
 	         "varying vec2 v;\nuniform sampler1D t1;\nuniform sampler2D t2;\n"
-	         "uniform sampler2DRect tr;\nvoid main() { %s }\n", fs_body);
+	         "uniform sampler2DRect tr;\nuniform sampler2D td;\nuniform sampler2DShadow ts;\n"
+	         "void main() { %s }\n", fs_body);
 	for (int i = 0; i < 2; i++) {
 		GLuint s = glCreateShader(i ? GL_FRAGMENT_SHADER : GL_VERTEX_SHADER);
 
@@ -243,6 +244,112 @@ flat_case(const char *name)
 	want_ok(want_flat, 2, name);
 }
 
+/* depth textures (M37): 64 x 64, the depth (x + 0.5) / 64 across; read as they
+ * are (d, d, d, 1), compared with 0.5 (shadow2D, LEQUAL: 1 from the middle
+ * right; GREATER the other way), and one the GPU rendered a slope into */
+static int shadow_func;      /* 0 none, else GL's */
+static GLuint desk_fbo;      /* gldesk's target */
+
+static void
+want_depth(float s, float t, float c[4])
+{
+	float d = ((int)(s * 64) + 0.5f) / 64.0f;
+
+	(void)t;
+	if (!shadow_func) {
+		c[0] = c[1] = c[2] = d;
+	} else {
+		float r = shadow_func == GL_LEQUAL ? 0.5f <= d : 0.5f > d;
+
+		c[0] = c[1] = c[2] = r;
+	}
+	c[3] = 1;
+}
+
+static void
+depth_cases(void)
+{
+	static float zs[64 * 64];
+	GLuint t;
+	struct { const char *name, *body; int func, gpu; } k[] = {
+		{ "a depth texture, read", "gl_FragColor = vec4(texture2D(td, v).rgb, 1.0);", 0, 0 },
+		{ "a depth texture, LEQUAL 0.5", "gl_FragColor = vec4(shadow2D(ts, vec3(v, 0.5)).rgb, 1.0);",
+		  GL_LEQUAL, 0 },
+		{ "a depth texture, GREATER 0.5", "gl_FragColor = vec4(shadow2D(ts, vec3(v, 0.5)).rgb, 1.0);",
+		  GL_GREATER, 0 },
+		{ "a shadow map the GPU drew, LEQUAL", "gl_FragColor = vec4(shadow2D(ts, vec3(v, 0.5)).rgb, 1.0);",
+		  GL_LEQUAL, 1 },
+	};
+
+	for (int i = 0; i < 64 * 64; i++)
+		zs[i] = (i % 64 + 0.5f) / 64.0f;
+	glActiveTexture(GL_TEXTURE3);
+	glGenTextures(1, &t);
+	glBindTexture(GL_TEXTURE_2D, t);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT24, 64, 64, 0, GL_DEPTH_COMPONENT, GL_FLOAT, zs);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_DEPTH_TEXTURE_MODE, GL_LUMINANCE);
+	for (unsigned i = 0; i < sizeof(k) / sizeof(k[0]); i++) {
+		char body[256];
+		GLuint p;
+
+		if (only && strncmp(k[i].name, only, strlen(only)))
+			continue;
+		if (k[i].gpu) {
+			/* the depth drawn: a quad from 0 at the left to 1 at the right,
+			 * in an FBO of the texture alone */
+			static const float quad[] = { -1, -1, -1, 1, -1, 1, -1, 1, -1, 1, 1, 1 };
+			GLuint fb;
+
+			glGenFramebuffers(1, &fb);
+			glBindFramebuffer(GL_FRAMEBUFFER, fb);
+			glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, t, 0);
+			glDrawBuffer(GL_NONE);
+			glReadBuffer(GL_NONE);
+			glClearDepth(1.0);
+			glClear(GL_DEPTH_BUFFER_BIT);
+			glEnable(GL_DEPTH_TEST);
+			glDepthFunc(GL_ALWAYS);
+			glUseProgram(0);
+			glEnableClientState(GL_VERTEX_ARRAY);
+			glVertexPointer(3, GL_FLOAT, 0, quad);
+			glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+			glDisableClientState(GL_VERTEX_ARRAY);
+			glDisable(GL_DEPTH_TEST);
+			/* (back to gldesk's own target) */
+			glBindFramebuffer(GL_FRAMEBUFFER, desk_fbo);
+			glDeleteFramebuffers(1, &fb);
+			glDrawBuffer(GL_COLOR_ATTACHMENT0);
+			glReadBuffer(GL_COLOR_ATTACHMENT0);
+		}
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_COMPARE_MODE,
+		                k[i].func ? GL_COMPARE_R_TO_TEXTURE : GL_NONE);
+		if (k[i].func)
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_COMPARE_FUNC, k[i].func);
+		snprintf(body, sizeof(body), "%s", k[i].body);
+		p = program(body);
+		glUseProgram(p);
+		glUniform1i(glGetUniformLocation(p, "td"), 3);
+		glUniform1i(glGetUniformLocation(p, "ts"), 3);
+		shadow_func = k[i].func;
+		{
+			static const float quad[] = { -1, -1, 1, -1, -1, 1, 1, 1 };
+
+			glClear(GL_COLOR_BUFFER_BIT);
+			glEnableVertexAttribArray(0);
+			glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, quad);
+			glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+			glDisableVertexAttribArray(0);
+		}
+		glUseProgram(0);
+		glDeleteProgram(p);
+		/* (the GPU's slope: depth (x + 0.5) / 64 at texel x too) */
+		want_ok(want_depth, 2, k[i].name);
+	}
+	glActiveTexture(GL_TEXTURE0);
+}
+
 /* the logic ops (M37): the target cleared to bytes 51 102 153 204, then
  * the program's colour -- bytes 32 i across, 32 j up, 128, 64 -- xor'ed
  * over it, through a colour mask, and with the left half discarded */
@@ -317,6 +424,7 @@ main(int argc, char **argv)
 	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, W, H, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
 	glGenFramebuffers(1, &fbo);
 	glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+	desk_fbo = fbo;
 	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, rt, 0);
 	/* (a depth buffer: the occlusion queries' quad behind another) */
 	{
@@ -424,6 +532,7 @@ main(int argc, char **argv)
 		glDisable(GL_TEXTURE_2D);
 	}
 
+	depth_cases();
 	glClearColor(0, 0, 0, 0);
 	flat_case("flat shading, the last vertex");
 	if (strstr((const char *)glGetString(GL_EXTENSIONS), "GL_ARB_provoking_vertex")) {

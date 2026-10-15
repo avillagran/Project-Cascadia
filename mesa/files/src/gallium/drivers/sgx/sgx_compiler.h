@@ -37,6 +37,13 @@ struct sgx_blend_key {
    uint8_t tex_swap, tex_x8, tex_srgb;
    uint8_t front_ccw;      /* gallium's, for gl_FrontFacing (0 when not read) */
    uint8_t logicop;        /* pipe_logicop + 1; 0: none (M37: iOS's are the program's) */
+   /* (M37) the units whose texture is depth -- its texel F32, raw, as d,
+    * 0, 0, 1 through its view's swizzle (GL's depth texture modes) -- and
+    * of those the ones compared (shadow samplers: in the program, as iOS's
+    * m07; nir_lower_tex_shadow), each one's func */
+   uint8_t tex_depth, tex_shadow;
+   uint8_t shadow_func[8];
+   uint8_t depth_swizzle[8][4];
 };
 
 #define SGX_FS_MAX_SAMPLERS 8

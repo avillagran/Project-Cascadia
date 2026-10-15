@@ -628,8 +628,25 @@ texture(struct comp *c, nir_tex_instr *tex, struct scratch *s)
                          usse_reg(USSE_SA, c->sampler_sa + 4 * c->slot_of_unit[tex->texture_index]),
                          mode, lodreg));
       emit(c, USSE_WDF0);
-      emit(c, usse_unpack_unorm8(treg(c, d), raw, 0));
-      emit(c, usse_unpack_unorm8(treg(c, d + 2), raw, 2));
+      if (c->fs->blend.tex_depth >> tex->texture_index & 1) {
+         /* a depth texture's texel is F32 (M37): d, 0, 0, 1 through the
+          * view's swizzle (a shadow lookup's comparison has its own) */
+         const uint8_t *swz = c->fs->blend.depth_swizzle[tex->texture_index];
+         bool shadow_done = c->fs->blend.tex_shadow >> tex->texture_index & 1;
+
+         for (unsigned i = 0; i < 4; i++) {
+            unsigned w = shadow_done ? PIPE_SWIZZLE_X : swz[i];
+
+            if (w == PIPE_SWIZZLE_X)
+               emit(c, usse_fmov(treg(c, d + i), raw));
+            else
+               emit(c, usse_fmov(treg(c, d + i), constant(c, s, w == PIPE_SWIZZLE_W ||
+                                                                 w == PIPE_SWIZZLE_1 ? 1.0f : 0.0f)));
+         }
+      } else {
+         emit(c, usse_unpack_unorm8(treg(c, d), raw, 0));
+         emit(c, usse_unpack_unorm8(treg(c, d + 2), raw, 2));
+      }
    }
    c->smp = true;
 out:
@@ -712,7 +729,8 @@ plan_inputs(struct comp *c, nir_function_impl *impl)
             int slot;
 
             if (instr->type != nir_instr_type_tex || c->nfetch == SGX_FRAME_MAX_FETCH ||
-                (slot = fetch_slot(nir_instr_as_tex(instr))) < 0 || c->flat[slot])
+                (slot = fetch_slot(nir_instr_as_tex(instr))) < 0 || c->flat[slot] ||
+                (c->fs->blend.tex_depth >> nir_instr_as_tex(instr)->texture_index & 1))
                continue;
             c->fetch_slot[c->nfetch] = slot;
             c->fetch[c->nfetch++] = nir_instr_as_tex(instr);
@@ -2267,6 +2285,25 @@ compile_fs(const nir_shader *fs, const struct sgx_blend_key *blend, char *why,
       }
       if (blend)
          tex.lower_srgb = blend->tex_srgb;
+      /* shadow samplers: the depth compared in the program (M37: iOS's
+       * m07 -- the reference clamped, `tex - ref >= 0`); one not compared
+       * by its sampler state (or before a variant says) passes */
+      {
+         enum compare_func func[8];
+         nir_lower_tex_shadow_swizzle swz[8];
+
+         for (unsigned u = 0; u < 8; u++) {
+            bool on = blend && (blend->tex_shadow >> u & 1);
+
+            func[u] = on ? blend->shadow_func[u] : COMPARE_FUNC_ALWAYS;
+            swz[u] = on ? (nir_lower_tex_shadow_swizzle){
+                             blend->depth_swizzle[u][0], blend->depth_swizzle[u][1],
+                             blend->depth_swizzle[u][2], blend->depth_swizzle[u][3] } :
+                          (nir_lower_tex_shadow_swizzle){
+                             PIPE_SWIZZLE_X, PIPE_SWIZZLE_X, PIPE_SWIZZLE_X, PIPE_SWIZZLE_1 };
+         }
+         NIR_PASS(_, s, nir_lower_tex_shadow, 8, func, swz, true);
+      }
       NIR_PASS(_, s, nir_lower_tex, &tex);
    }
    /* the facing bit is set for triangles anticlockwise in the target, row
