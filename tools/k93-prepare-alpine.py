@@ -21,6 +21,7 @@ SHA256='5552f1ef2398cee46ef2cf733f8f1258f39a77ad065dfd47282fc0df9fe1976c'
 URL=f'https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/armv7/alpine-minirootfs-{VERSION}-armv7.tar.gz'
 PACKAGES=['xorg-server','xf86-video-fbdev','xf86-input-evdev','xinit','xauth',
           'xterm','twm','font-misc-misc']
+BROWSER_PACKAGES=['firefox-esr','xdotool','font-dejavu']
 
 def rootfs_filter(member,destination):
     # Alpine's BusyBox applets use absolute symlinks. Rebase those inside
@@ -34,8 +35,11 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output',default='build/k93/alpine-gui-v1')
     parser.add_argument('--base-only',action='store_true')
+    parser.add_argument('--browser',action='store_true',help='Include Firefox ESR, diagnostic X input and scalable fonts in a new tree')
     parser.add_argument('--finish-existing',action='store_true',help='Validate and finish an already prepared tree; never reinstall packages')
     args=parser.parse_args()
+    assert not (args.base_only and args.browser),'Browser requires the graphical packages'
+    requested=PACKAGES+(BROWSER_PACKAGES if args.browser else [])
     output=(ROOT/args.output).resolve()
     assert output.is_relative_to(ROOT/'build/k93') and output.parent.exists()
     assert output.exists()==args.finish_existing,'Preserve existing tree; use a new output directory or explicit --finish-existing'
@@ -81,7 +85,7 @@ def main():
         assert resolvers,'No declared host DNS resolver'
         online=command[:3]+['--network','host','--dns',resolvers[0]]+command[3:]
         subprocess.run(online+['--root','/target','--arch','armv7','--usermode',
-                                '--no-scripts','--no-cache','add',*PACKAGES],check=True)
+                                '--no-scripts','--no-cache','add',*requested],check=True)
     database=(output/'lib/apk/db/installed').read_bytes()
     installed={}
     for record in database.decode().split('\n\n'):
@@ -90,7 +94,7 @@ def main():
             assert fields.get('A') in ('armv7','noarch'),fields.get('A')
             installed[fields['P']]=fields.get('V')
     if not args.base_only:
-        assert set(PACKAGES)<=installed.keys(),'Requested GUI packages missing'
+        assert set(requested)<=installed.keys(),'Requested GUI/browser packages missing'
         for executable,flag in [('/usr/libexec/Xorg','-version'),('/usr/bin/xterm','-version')]:
             check=command.copy()
             check[3:3]=['--network','none']
@@ -104,7 +108,8 @@ def main():
     size=sum(p.stat().st_size for p in files)
     manifest={'board':'K93AP','architecture':'armv7','alpine':VERSION,
               'source':URL,'minirootfs_sha256':SHA256,
-              'packages_requested':[] if args.base_only else PACKAGES,'installed_packages':installed,
+              'packages_requested':[] if args.base_only else requested,'installed_packages':installed,
+              'browser_included':args.browser,'browser_hardware_tested':False,
               'regular_file_bytes':size,'regular_files':len(files),
               'install_scripts_run':False,'hardware_tested':False,
               'package_database_sha256':hashlib.sha256(database).hexdigest()}

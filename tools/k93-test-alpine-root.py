@@ -5,10 +5,18 @@ import io
 from pathlib import Path
 import tarfile
 import tempfile
+import subprocess
+import sys
 
 source=Path(__file__).with_name('k93-prepare-alpine.py')
 spec=importlib.util.spec_from_file_location('alpine',source)
 module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+assert module.BROWSER_PACKAGES==['firefox-esr','xdotool','font-dejavu']
+assert not set(module.BROWSER_PACKAGES)&set(module.PACKAGES)
+# This contradiction must fail before any Docker invocation or output creation.
+invalid=subprocess.run([sys.executable,str(source),'--base-only','--browser'],
+                       capture_output=True,text=True)
+assert invalid.returncode!=0 and 'Browser requires the graphical packages' in invalid.stderr
 
 def archive(entries):
     data=io.BytesIO()
@@ -37,4 +45,4 @@ with tempfile.TemporaryDirectory(prefix='k93-alpine-filter-') as directory:
         else:
             raise AssertionError('Archive escape accepted: '+repr(entry))
     assert not (Path(directory)/'outside').exists()
-print('PASS: actual rootfs filter rebases absolute applet links and rejects escapes; no hardware')
+print('PASS: actual rootfs filter rebases absolute applet links and rejects escapes; browser/base conflict fails before setup; no hardware')

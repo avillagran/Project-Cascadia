@@ -17,6 +17,7 @@ source=source.replace('bb() { /bin/busybox "$@"; }',r'''bb() {
     if [ "$*" = 'test -f /root-transfer-network' ]; then
         [ "$K93_MODE" = network ]; return $?
     fi
+    if [ "$*" = 'cat /root-run-limit' ]; then printf '%s\n' "$K93_RUN_LIMIT"; fi
     return 0
 }''')
 start=source.index('rescue() {');end=source.index('\ntrap rescue EXIT',start)
@@ -27,9 +28,9 @@ source=source.replace('exec /bin/busybox switch_root /newroot /k93-init',
                       'bb switch_root /newroot /k93-init\ntrap - EXIT INT TERM')
 with tempfile.TemporaryDirectory(prefix='k93-squash-init-test-') as directory:
     log=Path(directory)/'commands'
-    def run(failure,mode='embedded'):
+    def run(failure,mode='embedded',limit='96'):
         if log.exists():log.unlink()
-        env=dict(os.environ,K93_MOCK_LOG=str(log),K93_FAIL=failure,K93_MODE=mode)
+        env=dict(os.environ,K93_MOCK_LOG=str(log),K93_FAIL=failure,K93_MODE=mode,K93_RUN_LIMIT=limit)
         result=subprocess.run(['sh','-s'],input=source,text=True,env=env)
         return result.returncode,log.read_text().splitlines()
     status,commands=run('')
@@ -56,6 +57,11 @@ with tempfile.TemporaryDirectory(prefix='k93-squash-init-test-') as directory:
     assert network.index(receiver)<network.index(checksum)<network.index(loop)
     assert 'mount -t tmpfs -o size=96m,nr_inodes=2048 tmpfs /run' in network
     assert 'ip address add 10.93.0.2/30 dev usb0' in network
+    status,larger=run('',mode='network',limit='192')
+    assert status==0 and 'mount -t tmpfs -o size=192m,nr_inodes=2048 tmpfs /run' in larger
+    for bad in ['','0','193','96; echo bad']:
+        status,observed=run('',mode='network',limit=bad)
+        assert status==77 and observed[-1]=='cat /root-run-limit'
     for failure in [receiver,checksum,loop]:
         status,observed=run(failure,mode='network')
         assert status==77 and observed==network[:network.index(failure)+1]

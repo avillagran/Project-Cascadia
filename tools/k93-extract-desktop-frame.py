@@ -22,6 +22,9 @@ def decode(text):
     start='\nK93_FB_PPM_BEGIN\n';end='\nK93_FB_PPM_END\n'
     assert text.count(start)==1 and text.count(end)==1
     body=text.split(start,1)[1].split(end,1)[0]
+    return decode_payload(body)
+
+def decode_payload(body):
     compressed=base64.b64decode(''.join(body.split()),validate=True)
     assert len(compressed)<2*1024*1024,'Unexpected capture size'
     with gzip.GzipFile(fileobj=io.BytesIO(compressed)) as stream:
