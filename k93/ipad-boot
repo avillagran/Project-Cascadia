@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# ipad-boot -- from whatever the iPad 2 is running to the Omarchy-style
+# desktop, with nobody at the iPad.
+#
+#   1. Linux up?  reset it through the SoC watchdog, back into iOS
+#   2. iOS up (jailbroken, ssh on Wi-Fi)?  kloader + Legacy iOS Kit's pwned iBSS
+#   3. pwned DFU: Cascadia's flash.sh sends the K93 iBEC and the bundle
+#   4. Linux: watchdog petter, touch (z2-boot -K), the sway session
+set -euo pipefail
+
+IPAD_IP="${IPAD_IP:?set IPAD_IP to the Wi-Fi address of the iPad}"
+# The jailbreak's stock root password; change it on the iPad and set this.
+IOS_PASSWORD="${IOS_PASSWORD:-alpine}"
+LIK="${LIK:-$HOME/Legacy-iOS-Kit}"
+CAS="${CAS:-$(cd "$(dirname "$0")/.." && pwd)}"
+IOS_SSH=(sshpass -p "$IOS_PASSWORD" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+         -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedAlgorithms=+ssh-rsa -o LogLevel=ERROR
+         -o ConnectTimeout=5)
+IOS_SCP=(sshpass -p "$IOS_PASSWORD" scp -O -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+         -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedAlgorithms=+ssh-rsa -o LogLevel=ERROR
+         -o ConnectTimeout=5)
+LNX_SSH=(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR
+         -o ConnectTimeout=8 root@10.55.0.2)
+
+say() { printf '==> %s\n' "$*"; }
+
+if "${LNX_SSH[@]}" true 2>/dev/null; then
+    say "Linux is up: resetting through the watchdog"
+    "${LNX_SSH[@]}" "sync; peek w 3f10302c 4; peek w 3f103024 124f80; peek w 3f103020 0" >/dev/null 2>&1 || true
+    sleep 10
+fi
+
+say "waiting for iOS on $IPAD_IP"
+for _ in $(seq 1 60); do
+    "${IOS_SSH[@]}" root@"$IPAD_IP" true 2>/dev/null && break
+    sleep 5
+done
+sleep 15   # let springboard settle; kloader right after boot has failed
+
+say "kDFU"
+"${IOS_SCP[@]}" "$LIK/resources/kloader/kloader" "$LIK/saved/iPad2,1/pwnediBSS" root@"$IPAD_IP":/tmp/
+timeout 20 "${IOS_SSH[@]}" root@"$IPAD_IP" "chmod +x /tmp/kloader; /tmp/kloader /tmp/pwnediBSS" >/dev/null 2>&1 || true
+for _ in $(seq 1 30); do lsusb | grep -q 05ac:1227 && break; sleep 2; done
+lsusb | grep -q 05ac:1227 || { echo "error: no DFU device" >&2; exit 1; }
+
+say "flash"
+cd "$CAS"
+LIK="$LIK" PATH="$LIK/bin/linux/x86_64:$PATH" bash tools/flash.sh --skip-pwn \
+    --ibec build/firmware/iBEC.patched.autogo.plain.dfu --no-uart 2>&1 \
+    | sed 's/\r/\n/g' | grep -v '^\[' | grep -v '^$' | tail -3
+timeout 60 ./cascadia net on >/dev/null 2>&1 || true
+
+say "watchdog, touch, desktop"
+sleep 5
+"${LNX_SSH[@]}" "setsid /sbin/wdt-pet </dev/null >/dev/null 2>&1 &
+    /usr/local/bin/omarchy-touch
+    sleep 6
+    setsid /usr/local/bin/omarchy-start </dev/null >/tmp/omarchy-start.log 2>&1 &
+    sleep 1; echo started"

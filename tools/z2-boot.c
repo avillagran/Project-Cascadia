@@ -87,6 +87,9 @@
  * Kernel side: /dev/hx-touch from drivers/input/touchscreen/apple-z2.c.
  *
  *   z2-boot [-c cal] [-P proxcal] [-F fll-mval] [-G pmu-gpio0] [-R] [-o m,m..] [-B] [-n] [-A] [-W] [-X] [-p secs] [-t secs] [-S] [-D] [-M reg:mask:val].. [-N] [mtprops]
+ *     -K  the iPad 2 (K93): ATTN on GPIO 21, K93.mtprops, calibration to
+ *         0x1000c000, MTSPIBootloader_Z2's calibration sequence, execute
+ *         at 0x10001800, fll-mval 0x18da
  *     -c  download this calibration blob (iOS "Calibration Data") to 0x10009000
  *     -P  download this prox calibration blob to 0x10009600
  *     -B  leave out the bf/af reports (the scan does not start)
@@ -208,18 +211,20 @@ static int xfer(const uint8_t *tx, uint8_t *rx, size_t n)
 }
 
 static int safe, seen_high;
+/* The ATTN pin: GPIO 22 on P105, 21 on K93 (ADT multi-touch interrupts). */
+static int attn_pin = 22;
 static volatile uint32_t *gpio;
 static char attn_level(void);
 
 #define GPIO_DISABLE0   (0x800 / 4)     /* pins 0..31, write 1 to disable */
 #define GPIO_STATUS0    (0x880 / 4)     /* pins 0..31, write 1 to clear */
-#define ATTN_BIT        (1u << 22)
+#define ATTN_BIT        (1u << attn_pin)
 
 static void arm_attn(void)
 {
     if(safe) {
         gpio[GPIO_STATUS0] = ATTN_BIT;
-        seen_high = gpio[22] & 1;
+        seen_high = gpio[attn_pin] & 1;
         return;
     }
     ioctl(fd, HXT_IOC_SETUP_IRQ);
@@ -245,7 +250,7 @@ static char attn_level(void)
             return '?';
         }
     }
-    return gpio[22] & 1 ? '1' : '0';
+    return gpio[attn_pin] & 1 ? '1' : '0';
 }
 
 /* grape-clk on GPIO 63, measured from the pad for 100 ms. */
@@ -437,7 +442,7 @@ static int wait_attn(unsigned ms)
             gpio[GPIO_STATUS0] = ATTN_BIT;
             return 1;
         }
-        if(gpio[22] & 1)
+        if(gpio[attn_pin] & 1)
             seen_high = 1;
         else if(seen_high)
             return 1;
@@ -546,6 +551,22 @@ static int reg_write(uint32_t addr, uint32_t val, uint32_t mask)
  * (0x80607f04): DATA packets of at most 0x3f0 bytes, each answered by
  * ATN_ACK 4bc1, up to five tries per packet.  The length is padded to whole
  * words with zeros, as iOS rounds it up. */
+/* K93's function-enable_download, GPIO 140 (ADT 0x1104, active high): iOS's
+ * MTSPIBootloader_Z2::bootloadDevice (12H321, 0x806ee978) raises it before the
+ * HBPP check and drops it after EXECUTE, and the driver does the same around
+ * its own HBPP probe (0x806ed0f2 / 0x806ed148).  The reset itself happens
+ * with it low. */
+#define DOWNLOAD_PIN 140
+static int dl_invert;   /* -I: drive it active low instead */
+static int dl_keep;     /* -L: leave it asserted after EXECUTE */
+static void set_download(int on)
+{
+    if(attn_level() == '?')
+        return;
+    gpio[DOWNLOAD_PIN] = (gpio[DOWNLOAD_PIN] & ~1u) | ((on ^ dl_invert) ? 1u : 0u);
+    printf("  download pin -> %d (cfg %08x)\n", on, (unsigned)gpio[DOWNLOAD_PIN]);
+}
+
 static int download(const char *what, uint32_t addr, const uint8_t *src, size_t len)
 {
     static uint8_t pkt[2 + 10 + 0x3f0 + 4];
@@ -868,7 +889,8 @@ int main(int argc, char **argv)
 {
     const char *mtprops = "/lib/firmware/P105.mtprops", *calpath = NULL, *proxpath = NULL;
     char *modes = NULL;
-    int opt, noscan = 0, nocal = 0, opmode = 0, nodef = 0, pmugpio = -1, listrep = 0, hold = -1, noready = 0, poll = 0, wake = 0;
+    int mforce[4], have_mforce = 0;
+    int opt, k93 = 0, noscan = 0, nocal = 0, opmode = 0, nodef = 0, pmugpio = -1, listrep = 0, hold = -1, noready = 0, poll = 0, wake = 0;
     uint8_t *fw, *cal = NULL, *prox = NULL, c[16], res[16];
     size_t fwlen, callen = 0, proxlen = 0;
     uint32_t ver, v, fll = 0x17c9;
@@ -876,7 +898,7 @@ int main(int argc, char **argv)
     struct hxt_metrics m = { 0, 0, 0, 0 };
     unsigned i;
 
-    while((opt = getopt(argc, argv, "c:F:G:P:Ro:BnAWXNSDM:p:t:")) != -1) {
+    while((opt = getopt(argc, argv, "c:F:G:P:Ro:BnAWXNSDM:p:t:KILm:")) != -1) {
         switch(opt) {
         case 'c': calpath = optarg; break;
         case 'P': proxpath = optarg; break;
@@ -893,6 +915,13 @@ int main(int argc, char **argv)
                 fprintf(stderr, "-M wants reg:mask:val in hex\n");
             break;
         case 'W': wake = 1; break;
+        case 'I': dl_invert = 1; break;
+        case 'L': dl_keep = 1; break;
+        case 'm':   /* -m left,right,top,bottom: the surface, instead of report d9 */
+            if(sscanf(optarg, "%d,%d,%d,%d", &mforce[0], &mforce[1], &mforce[2], &mforce[3]) == 4)
+                have_mforce = 1;
+            break;
+        case 'K': k93 = 1; attn_pin = 21; mtprops = "/lib/firmware/K93.mtprops"; break;
         case 'X': nodef = 1; break;
         case 'p': poll = atoi(optarg); break;
         case 't': hold = atoi(optarg); break;
@@ -907,6 +936,8 @@ int main(int argc, char **argv)
     }
     if(optind < argc)
         mtprops = argv[optind];
+    if(k93 && fll == 0x17c9)
+        fll = 0x18da;   /* personality "Z2,K94" */
     setvbuf(stdout, NULL, _IOLBF, 0);
     clock_gettime(CLOCK_MONOTONIC, &t_start);
 
@@ -945,7 +976,7 @@ int main(int argc, char **argv)
         gpio[GPIO_DISABLE0] = ATTN_BIT;
         gpio[GPIO_STATUS0] = ATTN_BIT;
         printf("== -S: ATTN's interrupt masked in the GPIO block, watching the pad (cfg %08x)\n",
-               (unsigned)gpio[22]);
+               (unsigned)gpio[attn_pin]);
     }
 
     stamp("opened");
@@ -969,6 +1000,8 @@ int main(int argc, char **argv)
     }
 
     printf("== reset\n");
+    if(k93)
+        set_download(0);
     /* hx-touchd's order, which the chip has answered: a reset, one transfer
      * with chip select off so the controller has driven the clock to its idle
      * level, then the reset that counts -- iOS's resetDevice likewise starts
@@ -989,6 +1022,10 @@ int main(int argc, char **argv)
         hex("REQ_WAKEUP ->", res, 2);
         usleep(10000);
     }
+    if(k93) {
+        set_download(1);
+        usleep(1000);
+    }
     if(!hbpp_check())
         printf("  not in HBPP -- carrying on to see what the chip does\n");
 
@@ -1003,13 +1040,35 @@ int main(int argc, char **argv)
 
     if(prox || cal) {
         printf("== calibration (MTSPIBootloader_Z2: prox first, then the panel's)\n");
-        if(prox && download("prox calibration", 0x10009600, prox, proxlen))
+        if(prox && download("prox calibration", k93 ? 0x400180 : 0x10009600, prox, proxlen))
             return 1;
-        if(cal && download("calibration", 0x10009000, cal, callen))
+        if(cal && download("calibration", k93 ? 0x1000c000 : 0x10009000, cal, callen))
             return 1;
     }
 
-    if(!nocal) {
+    if(!nocal && k93) {
+        /* MTSPIBootloader_Z2's own performCalibSeq, K93 12H321 (vtable slot
+         * 0x7c, 0x806eeaa0): the four writes are skipped for chip version
+         * 0x5a020028.  fll-mval and its address come from the personality
+         * "AppleMultitouchSPI - Z2,K94" (0x18da) and the Z2 defaults
+         * (0x806ef7e4: fll-mval-addr 0x10001c04). */
+        printf("== performCalibSeq (MTSPIBootloader_Z2, K93)\n");
+        reg_read(0x10008ffc, &ver);
+        if(ver != 0x5a020028) {
+            reg_write(0x10001c04, fll, 0x1fff);
+            reg_write(0x10001c08, 0x840000, 0xff0000);
+            reg_write(0x1000300c, 5, 0x85);
+            reg_write(0x1000304c, 0x20, 0xffffffff);
+        }
+        c[0] = 0x1f; c[1] = 0x01;
+        arm_attn();
+        xfer(c, res, 2);
+        hex("calib request ->", res, 2);
+        usleep(65000);
+        printf("  ATTN during calibration: %s\n", wait_attn(100) ? "yes" : "no");
+        if(atn_ack(&st) == 0)
+            printf("  calibration ack %04x\n", st);
+    } else if(!nocal) {
         printf("== performCalibSeq (MTSPIBootloader_N1)\n");
         reg_read(0x10008ffc, &ver);
         reg_write(0x10003060, fll, 0xffffffff);             /* fll-mval */
@@ -1032,9 +1091,14 @@ int main(int argc, char **argv)
 
     printf("== execute\n");
     arm_attn();
-    execute(0x10003400);
+    execute(k93 ? 0x10001800 : 0x10003400);
     usleep(40000);
     printf("  ATTN after execute: %s\n", wait_attn(200) ? "yes" : "no");
+    if(k93) {
+        if(!dl_keep)
+            set_download(0);
+        usleep(40000);
+    }
 
     stamp("executed");
     printf("== post-boot (iOS, logs/ios-mtlog1.txt)\n");
@@ -1104,6 +1168,9 @@ int main(int argc, char **argv)
         m.top = (int16_t)(d9[13] | d9[14] << 8);
         m.right = (int16_t)(d9[15] | d9[16] << 8);
         m.bottom = (int16_t)(d9[17] | d9[18] << 8);
+    }
+    if(have_mforce) {
+        m.left = mforce[0]; m.right = mforce[1]; m.top = mforce[2]; m.bottom = mforce[3];
     }
     printf("  metrics x %d..%d y %d..%d\n", m.left, m.right, m.top, m.bottom);
     if(ioctl(fd, HXT_IOC_METRICS, &m) < 0)

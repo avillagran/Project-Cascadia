@@ -1,0 +1,8 @@
+#!/bin/sh
+# omarchy-menu -- SUPER+Esc, as in Omarchy: lock-free power menu.
+choice=$(printf '%s\n' "  Reload" "  Back to iOS" "  Power off" | fuzzel --dmenu --prompt "  ")
+case "$choice" in
+*Reload*)    swaymsg reload ;;
+*iOS*)       sync; peek w 3f10302c 4 >/dev/null; peek w 3f103024 124f80 >/dev/null; peek w 3f103020 0 >/dev/null ;;
+*Power*)     sync; poweroff -f ;;
+esac

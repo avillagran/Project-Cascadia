@@ -1,0 +1,23 @@
+#!/bin/sh
+# omarchy-session -- start the Omarchy-style desktop on the iPad's panel.
+#
+# simpledrm is the display (/dev/dri/card0), so wlroots gets KMS but no GPU
+# it can render with: pixman does the drawing on the CPU.  seatd hands sway
+# the DRM and input devices; libinput finds those through udev.
+export XDG_RUNTIME_DIR=/run/user/0
+mkdir -p "$XDG_RUNTIME_DIR" && chmod 700 "$XDG_RUNTIME_DIR"
+export WLR_RENDERER=pixman
+export WLR_NO_HARDWARE_CURSORS=1
+export WLR_LIBINPUT_NO_DEVICES=1
+export XDG_CURRENT_DESKTOP=sway
+export XDG_SESSION_TYPE=wayland
+
+if ! pgrep -x udevd >/dev/null; then
+	udevd --daemon
+	udevadm trigger --action=add
+	udevadm settle --timeout=10
+fi
+pgrep -x seatd >/dev/null || { seatd -g video >/tmp/seatd.log 2>&1 & sleep 1; }
+export LIBSEAT_BACKEND=seatd
+[ -s /etc/machine-id ] || dbus-uuidgen > /etc/machine-id
+exec dbus-run-session sway -d >/tmp/sway.log 2>&1

@@ -243,7 +243,7 @@ cmd_build() {
     # Capture rather than pipe: a pipeline hands back the last command's status,
     # so a docker failure here used to surface as the far less useful "dtc
     # produced no dtb" with the real error scrolled past.
-    if ! out=$(in_docker "dtc -I dts -O dtb -f dts/p105ap.dts -o dtb/p105ap.dtb" 2>&1); then
+    if ! out=$(in_docker "dtc -I dts -O dtb -f ${DTS:-dts/p105ap.dts} -o dtb/p105ap.dtb" 2>&1); then
         printf '%s\n' "$out" >&2
         fail "dtc failed -- see above"
     fi
@@ -413,7 +413,7 @@ cmd_build() {
     # set -o pipefail INSIDE the container shell: without it a failed build
     # returns the status of whatever the output was piped into, and the stale
     # artifacts from last time get shipped as if they were fresh.
-    in_docker "set -o pipefail; bash scripts/build-kernel.sh 2>&1 | tail -25"
+    in_docker "set -o pipefail; KCONFIG_EXTRA=${KCONFIG_EXTRA:-} bash scripts/build-kernel.sh 2>&1 | tail -25"
 
     say "4/6 freshness"
     CPIO="$ROOT/build/linux/usr/initramfs_data.cpio"

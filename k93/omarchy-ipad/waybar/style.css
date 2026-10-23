@@ -1,0 +1,41 @@
+/* Tokyo Night, as Omarchy ships it */
+* {
+    font-family: "JetBrainsMono Nerd Font";
+    font-size: 15px;
+    min-height: 0;
+    border: none;
+}
+
+window#waybar {
+    background: #1a1b26;
+    color: #a9b1d6;
+}
+
+#custom-omarchy {
+    color: #7aa2f7;
+    font-size: 20px;
+    padding: 0 14px;
+}
+
+#workspaces button {
+    color: #565f89;
+    padding: 0 10px;
+}
+
+#workspaces button.focused {
+    color: #7aa2f7;
+}
+
+#clock {
+    color: #c0caf5;
+}
+
+#custom-keyboard,
+#custom-terminal,
+#network,
+#battery {
+    padding: 0 12px;
+}
+
+#battery.warning { color: #e0af68; }
+#battery.critical { color: #f7768e; }

@@ -1,0 +1,44 @@
+#!/bin/sh
+# omarchy-start -- Omarchy 3.8 (Hyprland) on the iPad 2, as user "omarchy".
+#
+# Hyprland needs GLES 3, which the SGX543 does not have, so Mesa renders on
+# the CPU: GBM on simpledrm's card0 loads kms_swrast, i.e. llvmpipe, which
+# speaks GLES 3.2.  card1 (the SGX) is kept away from aquamarine.
+U=omarchy
+UID_=$(id -u $U)
+RUNDIR=/run/user/$UID_
+mkdir -p "$RUNDIR" && chown $U:$U "$RUNDIR" && chmod 700 "$RUNDIR"
+
+if ! pgrep -x udevd >/dev/null; then
+	udevd --daemon
+	udevadm trigger --action=add
+	udevadm settle --timeout=10
+fi
+pgrep -x seatd >/dev/null || { seatd -g video >/tmp/seatd.log 2>&1 & sleep 1; }
+[ -s /etc/machine-id ] || dbus-uuidgen > /etc/machine-id
+# The system bus, which a normal login already has; waybar's modules want it.
+if [ ! -S /run/dbus/system_bus_socket ]; then
+	mkdir -p /run/dbus
+	dbus-daemon --system --fork
+fi
+# Mesa would pick the SGX's render node first, find no driver for it and
+# fall into zink; hidden, GBM on simpledrm loads kms_swrast (llvmpipe) by
+# itself.  Forcing MESA_LOADER_DRIVER_OVERRIDE=kms_swrast breaks it.
+chmod 600 /dev/dri/renderD128 /dev/dri/card1 2>/dev/null
+chmod 666 /tmp/hyprland.log 2>/dev/null
+
+exec su -s /bin/sh $U -c "
+export HOME=/home/$U
+cd /home/$U
+export OMARCHY_PATH=/home/$U/.local/share/omarchy
+export PATH=\$OMARCHY_PATH/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+export XDG_RUNTIME_DIR=$RUNDIR
+export AQ_DRM_DEVICES=/dev/dri/card0
+export GALLIUM_DRIVER=llvmpipe
+export LIBSEAT_BACKEND=seatd
+export XDG_SESSION_TYPE=wayland
+mkdir -p \$HOME/.config/mako
+ln -snf \$HOME/.config/omarchy/current/theme/mako.ini \$HOME/.config/mako/config
+# What Omarchy gets from systemd user units: the audio server.
+exec dbus-run-session sh -c 'pipewire >/tmp/pipewire.log 2>&1 & sleep 1; wireplumber >/dev/null 2>&1 & pipewire-pulse >/dev/null 2>&1 & exec Hyprland >/tmp/hyprland.log 2>&1'
+"

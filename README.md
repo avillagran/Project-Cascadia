@@ -1,3 +1,6 @@
+> **This fork / branch `k93-ipad2`:** a port to the **iPad 2 (iPad2,1 / K93AP)** running
+> Omarchy 3.8 — it works and it is **unusable** in practice. See [k93/README.md](k93/README.md).
+
 # Project Cascadia — Native Linux on Apple A5
 
 Mainline Linux 6.12 on an iPad mini 1 (iPad2,5 / S5L8942X), booting to an

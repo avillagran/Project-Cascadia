@@ -1,0 +1,5 @@
+#!/bin/sh
+# uwsm-app shim: Omarchy launches every app through uwsm, which needs systemd.
+# Alpine has neither, so start the program directly.
+[ "$1" = "--" ] && shift
+exec "$@"

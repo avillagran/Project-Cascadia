@@ -1,0 +1,7 @@
+#!/bin/sh
+# xdg-terminal-exec shim: Omarchy's default terminal, Alacritty.
+dir=
+case "$1" in --dir=*) dir="${1#--dir=}"; shift ;; esac
+[ -n "$dir" ] && [ -d "$dir" ] && cd "$dir"
+[ $# -gt 0 ] && exec alacritty -e "$@"
+exec alacritty

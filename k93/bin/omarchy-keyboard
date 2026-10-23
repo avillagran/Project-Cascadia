@@ -1,0 +1,11 @@
+#!/bin/sh
+# omarchy-keyboard -- the on-screen keyboard, for a desktop with only touch.
+# Started hidden with the session; SIGRTMIN toggles it (waybar's ⌨, SUPER+K).
+if pgrep -x wvkbd-mobintl >/dev/null; then
+	pkill -RTMIN wvkbd-mobintl
+else
+	case "$1" in
+	--hidden) exec wvkbd-mobintl --hidden -L 300 ;;
+	*)        exec wvkbd-mobintl -L 300 ;;
+	esac
+fi

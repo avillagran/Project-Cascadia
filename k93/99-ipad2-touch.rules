@@ -1,0 +1,4 @@
+# iPad 2 (K93) Z2 digitizer: its axes are rotated against the landscape panel.
+# Measured from corner taps with z2-boot -m -5000,25000,-5000,25000:
+#   screen x = 1.2495 - 1.4657 v,  screen y = 1.9637 u - 0.2983   (u, v in 0..1)
+ENV{ID_INPUT_TOUCHSCREEN}=="1", ATTRS{name}=="S5L8940X Capacitive TouchScreen", ENV{LIBINPUT_CALIBRATION_MATRIX}="0 -1.4657 1.2495 1.9637 0 -0.2983"

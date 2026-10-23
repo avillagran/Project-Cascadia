@@ -1,0 +1,14 @@
+#!/bin/sh
+# walker shim: walker/elephant are not packaged for armv7; fuzzel stands in.
+# Omarchy's menus call `walker --dmenu ... -p PROMPT`.
+dmenu=0; prompt=
+while [ $# -gt 0 ]; do
+	case "$1" in
+	--dmenu|-d) dmenu=1 ;;
+	-p|--placeholder) shift; prompt="$1" ;;
+	--width|--minheight|--maxheight|-w|-h|--theme|-t|-c|--config) shift ;;
+	esac
+	shift
+done
+if [ $dmenu = 1 ]; then exec fuzzel --dmenu ${prompt:+--prompt "$prompt "}; fi
+exec fuzzel

@@ -56,6 +56,11 @@ def _link_bytes(ld: str, asm: str) -> bytes:
                 "arm-linux-gnueabihf-gcc",
                 "-nostdlib",
                 "-mthumb",
+                # Without these the toolchain puts a .note.gnu.build-id at
+                # the link address and .text 0x24 bytes after it, so every
+                # branch is computed from the wrong place.
+                "-no-pie",
+                "-Wl,--build-id=none",
                 "-T",
                 str(root / "patch.ld"),
                 "-o",

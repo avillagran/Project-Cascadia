@@ -1,0 +1,82 @@
+# Omarchy for iPad 2 -- sway, set up the way Omarchy sets up Hyprland.
+#
+# Hyprland needs GLES 3; the iPad 2's SGX543 stops at GLES 2, so this is sway
+# (wlroots) on simpledrm with the pixman renderer.  The bindings are Omarchy's.
+
+set $mod Mod4
+set $term foot
+set $menu fuzzel
+set $browser netsurf-gtk3
+set $files pcmanfm
+
+# Tokyo Night, Omarchy's default theme
+set $bg      #1a1b26
+set $bg_alt  #24283b
+set $fg      #a9b1d6
+set $blue    #7aa2f7
+set $magenta #bb9af7
+set $red     #f7768e
+set $grey    #414868
+
+font pango:JetBrainsMono Nerd Font 11
+output * bg $bg solid_color
+output * scale 1
+
+default_border pixel 2
+default_floating_border pixel 2
+gaps inner 5
+gaps outer 5
+smart_gaps on
+
+#                       border  background text  indicator child_border
+client.focused          $blue   $bg_alt    $fg   $magenta  $blue
+client.focused_inactive $grey   $bg        $fg   $grey     $grey
+client.unfocused        $grey   $bg        $grey $grey     $grey
+client.urgent           $red    $bg        $fg   $red      $red
+
+# Touch: map the digitizer to the panel, tap to focus.
+input type:touch map_to_output *
+focus_follows_mouse no
+
+# --- Omarchy bindings ---------------------------------------------------
+bindsym $mod+Return exec $term
+bindsym $mod+space exec $menu
+bindsym $mod+b exec $browser
+bindsym $mod+f exec $files
+bindsym $mod+w kill
+bindsym $mod+v floating toggle
+bindsym $mod+j layout toggle split
+bindsym $mod+Shift+f fullscreen toggle
+bindsym $mod+Escape exec omarchy-menu
+bindsym $mod+k exec omarchy-keyboard
+
+bindsym $mod+Left focus left
+bindsym $mod+Right focus right
+bindsym $mod+Up focus up
+bindsym $mod+Down focus down
+bindsym $mod+Shift+Left move left
+bindsym $mod+Shift+Right move right
+bindsym $mod+Shift+Up move up
+bindsym $mod+Shift+Down move down
+
+bindsym $mod+1 workspace number 1
+bindsym $mod+2 workspace number 2
+bindsym $mod+3 workspace number 3
+bindsym $mod+4 workspace number 4
+bindsym $mod+5 workspace number 5
+bindsym $mod+Shift+1 move container to workspace number 1
+bindsym $mod+Shift+2 move container to workspace number 2
+bindsym $mod+Shift+3 move container to workspace number 3
+bindsym $mod+Shift+4 move container to workspace number 4
+bindsym $mod+Shift+5 move container to workspace number 5
+
+bindsym $mod+Shift+r reload
+bindsym $mod+Shift+e exec swaymsg exit
+
+floating_modifier $mod normal
+
+bar {
+    swaybar_command waybar
+}
+
+exec omarchy-keyboard --hidden

@@ -1,0 +1,27 @@
+#!/bin/sh
+# omarchy-touch -- bring up the iPad 2's Z2 digitizer and hand it to the kernel.
+#
+# K93 recipe (z2-boot -K): PMU 0x20 bit 0x20 powers the digitizer (ADT
+# function-power_ldo, LDO 0); PMU GPIO0 at 0x51 is its 32 kHz (bits 7:6 = 01,
+# clock out); the download pin is active low (-I).  The bootload is timing
+# sensitive under load, so it is retried until the chip reports family 0x13.
+# The surface metrics the calibration matrix in /etc/udev/rules.d/99-ipad2-touch.rules was measured with.
+: ${Z2_METRICS:=-5000,25000,-5000,25000}
+pkill -f z2-boot-k93 2>/dev/null
+for try in 1 2 3 4 5 6; do
+	/usr/local/bin/z2-boot-k93 -K -I -c /lib/firmware/mtcal.bin -M 20:20:20 -G 0x51 ${Z2_METRICS:+-m $Z2_METRICS} \
+		</dev/null >/tmp/z2.log 2>&1 &
+	pid=$!
+	for _ in 1 2 3 4 5 6 7 8 9 10; do
+		grep -q "READY" /tmp/z2.log && break
+		sleep 1
+	done
+	if grep -q "device info: family 13" /tmp/z2.log; then
+		echo "touch up (try $try)"
+		exit 0
+	fi
+	kill "$pid" 2>/dev/null
+	sleep 1
+done
+echo "touch: digitizer did not come up, see /tmp/z2.log" >&2
+exit 1

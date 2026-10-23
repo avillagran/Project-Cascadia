@@ -1,0 +1,3 @@
+#!/bin/sh
+# omarchy-hyprland-monitor-watch: not available on armv7 Alpine; Omarchy calls it, so it exists and does nothing.
+exit 0
