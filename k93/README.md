@@ -1,18 +1,23 @@
-# Omarchy on the iPad 2 (iPad2,1 / K93AP) — UNUSABLE
+# Omarchy on the iPad 2 (iPad2,1 / K93AP) — ABANDONED, NOT RECOMMENDED
 
-> **⚠️ This works, and it is unusable.** It boots, the touch screen works, and
-> Omarchy 3.8 runs on Hyprland. But the iPad 2's GPU cannot do what Hyprland
-> needs, so every frame is drawn by the CPU on two 1 GHz Cortex-A9 cores.
-> Opening a menu takes seconds. Omarchy is driven from the keyboard, and
-> touch alone cannot get you out of its menus. **Do not expect to use this
-> iPad for anything with it.** It is published as a record of what it takes,
-> and as a starting point for a lighter setup.
+> **🛑 Status: abandoned. This was an experiment. Do not use it.**
 >
-> **ES:** Funciona, y es inutilizable. Arranca, el touch funciona y Omarchy
-> 3.8 corre sobre Hyprland. Pero la GPU del iPad 2 no puede con Hyprland, así
-> que todo lo dibuja la CPU (dos Cortex-A9 a 1 GHz). Abrir un menú tarda
-> segundos, y Omarchy se maneja con teclado, así que con el dedo no se sale de
-> sus menús. No sirve para el uso diario.
+> It boots, the touch screen works, and Omarchy 3.8 runs on Hyprland. The
+> screenshot below proves that it runs, and that is all it proves. Every frame
+> is drawn by the CPU (two 1 GHz Cortex-A9 cores), so opening a menu takes
+> seconds. Omarchy is driven from the keyboard, so touch alone gets stuck in
+> its menus. There is no sound, no Wi-Fi and no buttons. **The same iPad on
+> jailbroken iOS 8.4.1 is smoother, and everything works there.** The goal was
+> to watch YouTube or Twitch in a normal browser; that is not possible here
+> (see [Findings](#findings)). Nothing more will be done on this branch.
+>
+> **ES — Abandonado. Fue un experimento y NO SE RECOMIENDA.** Arranca, el
+> touch funciona y Omarchy 3.8 corre sobre Hyprland: la captura muestra que
+> funciona, pero es solo eso. Todo lo dibuja la CPU, abrir un menú tarda
+> segundos, y sin teclado no se sale de los menús. No hay sonido, ni Wi-Fi,
+> ni botones. El mismo iPad con iOS 8.4.1 y jailbreak es más fluido y todo
+> funciona. El objetivo era ver YouTube o Twitch en un navegador normal, y eso
+> no es posible en este hardware. Este proyecto no seguirá.
 
 ![Omarchy 3.8 on the iPad 2, captured from the device](images/omarchy-ipad2-screenshot.png)
 
@@ -88,6 +93,51 @@ Things that had to be found out:
 
 `k93/omarchy-ipad/` and `omarchy-session` are a lighter Omarchy-style sway
 setup (pixman renderer) tried first.
+
+## Findings
+
+What was measured on the device, and why the project stopped.
+
+**Video works, without a desktop.** `mpv --vo=drm --hwdec=no` straight on
+the framebuffer (no compositor), CPU decode only:
+
+| Source | Result |
+|---|---|
+| YouTube 360p (H.264), via yt-dlp | smooth, 0 dropped frames |
+| Twitch 360p, via streamlink | smooth, 0 dropped frames |
+| local 720p H.264 file | 6 dropped frames in 8 s at 30 fps |
+
+YouTube needs `nodejs` for yt-dlp and the `mweb` player client to get past
+its bot check, and then only offers 360p. Higher qualities need PO tokens.
+There is no sound, so this is still not usable.
+
+**A normal browser is out of reach, whatever the drivers.**
+
+- On iOS, the iPad 2 stops at iOS 9.3.5, and its Safari can no longer load
+  today's YouTube or Twitch. A jailbreak can't replace the browser engine.
+- On Linux, a modern browser would load the pages, but YouTube or Twitch in
+  a browser needs about as much memory as the iPad has: 512 MB. Getting the
+  GPU working would make the interface smooth. It would not add memory or
+  CPU, so the browser would still be unusable.
+- Chromium is barely built for 32-bit ARM any more; Firefox is what's left.
+
+**What full hardware support would and would not buy:**
+
+| | Interface | YouTube/Twitch in a browser |
+|---|---|---|
+| As it is (CPU rendering) | very slow | not viable |
+| With GPU and video decoder | smooth, about like iOS | still too heavy (512 MB RAM) |
+| Lightweight player (mpv) | fine | plays, but it is not a browser |
+
+- **GPU** (PowerVR SGX543MP2): Cascadia's driver reaches GLES 2. Hyprland
+  needs GLES 3, and sway's GLES 2 renderer was not tried.
+- **Video decoder:** no Linux driver exists; writing one means reverse
+  engineering the block.
+- **Booting from the iPad itself, without RAM or NFS:** there is no driver
+  for the internal NAND. The A5 also can't start Linux on its own: it always
+  needs iOS (kloader, as here), a Pi Pico, or a computer over USB.
+
+**Not started:** audio, Wi-Fi (BCM4329 on SDIO), buttons.
 
 ## Building and booting
 

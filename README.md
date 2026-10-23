@@ -1,5 +1,7 @@
-> **This fork / branch `k93-ipad2`:** a port to the **iPad 2 (iPad2,1 / K93AP)** running
-> Omarchy 3.8 — it works and it is **unusable** in practice. See [k93/README.md](k93/README.md).
+> **This fork / branch `k93-ipad2` is ABANDONED and NOT RECOMMENDED.** It was an
+> experiment porting Cascadia to the **iPad 2 (iPad2,1 / K93AP)** and running Omarchy
+> 3.8 on it. It runs, and it is not usable; jailbroken iOS on the same iPad works
+> better. Findings and the reasons: [k93/README.md](k93/README.md).
 
 # Project Cascadia — Native Linux on Apple A5
 
